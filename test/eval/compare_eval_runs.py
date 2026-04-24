@@ -9,7 +9,7 @@ import numpy as np
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compare a candidate static-eval run against an FP32 baseline run."
+        description="Compare a candidate OMAT24 static-eval run against an FP32 baseline run."
     )
     parser.add_argument("--baseline-dir", required=True)
     parser.add_argument("--candidate-dir", required=True)
@@ -33,28 +33,9 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 def record_key(row: dict) -> tuple[str, str, str]:
-    return (
-        row.get("material_id", ""),
-        row.get("structure_role", ""),
-        row.get("cif_path", ""),
-    )
-
-
-def force_metrics(base: np.ndarray, cand: np.ndarray) -> dict:
-    diff = cand - base
-    comp_abs = np.abs(diff).reshape(-1)
-    vec_abs = np.linalg.norm(diff, axis=1)
-    return {
-        "force_mae": float(comp_abs.mean()) if comp_abs.size else 0.0,
-        "force_rmse": float(np.sqrt((diff ** 2).mean())) if diff.size else 0.0,
-        "max_force_error": float(vec_abs.max()) if vec_abs.size else 0.0,
-        "p95_force_error": float(np.percentile(vec_abs, 95)) if vec_abs.size else 0.0,
-        "p99_force_error": float(np.percentile(vec_abs, 99)) if vec_abs.size else 0.0,
-    }
-
-
-def stress_mae(base: np.ndarray, cand: np.ndarray) -> float:
-    return float(np.abs(cand - base).mean()) if base.size else 0.0
+    if "sample_index" in row:
+        return (str(row["sample_index"]), "", "")
+    return (row.get("material_id", ""), row.get("structure_role", ""), row.get("cif_path", ""))
 
 
 def build_comparison_rows(baseline_rows: list[dict], candidate_rows: list[dict]) -> list[dict]:
@@ -67,42 +48,54 @@ def build_comparison_rows(baseline_rows: list[dict], candidate_rows: list[dict])
         base = base_map[key]
         cand = cand_map[key]
 
-        nsites = int(base.get("nsites") or 1)
+        n_atoms = int(base.get("n_atoms") or base.get("nsites") or 1)
+        baseline_latency = float(base.get("latency_ms", 0.0))
+        candidate_latency = float(cand.get("latency_ms", 0.0))
         row = {
-            "material_id": base.get("material_id", ""),
-            "structure_role": base.get("structure_role", ""),
-            "nsites": nsites,
-            "crystal_system": base.get("crystal_system", ""),
-            "is_magnetic": base.get("is_magnetic", ""),
-            "latency_ms_baseline": float(base.get("latency_ms", 0.0)),
-            "latency_ms_candidate": float(cand.get("latency_ms", 0.0)),
-            "energy_abs_delta_eV": abs(float(cand["pred_energy_eV"]) - float(base["pred_energy_eV"])),
+            "sample_index": base.get("sample_index", ""),
+            "sid": base.get("sid", ""),
+            "formula": base.get("formula", base.get("formula_pretty", "")),
+            "n_atoms": n_atoms,
+            "latency_ms_baseline": baseline_latency,
+            "latency_ms_candidate": candidate_latency,
+            "latency_speedup": baseline_latency / candidate_latency if candidate_latency > 0 else None,
+            "pred_energy_abs_delta_eV": abs(float(cand["pred_energy_eV"]) - float(base["pred_energy_eV"])),
         }
-        row["energy_abs_delta_meV_per_atom"] = row["energy_abs_delta_eV"] * 1000.0 / max(nsites, 1)
 
-        if "pred_forces_eVA" in base and "pred_forces_eVA" in cand:
-            fm = force_metrics(
-                np.asarray(base["pred_forces_eVA"], dtype=float),
-                np.asarray(cand["pred_forces_eVA"], dtype=float),
-            )
-            row.update(fm)
+        row["pred_energy_abs_delta_meV_per_atom"] = (
+            row["pred_energy_abs_delta_eV"] * 1000.0 / max(n_atoms, 1)
+        )
 
-        if "pred_stress_eVA3" in base and "pred_stress_eVA3" in cand:
-            row["stress_mae_eVA3"] = stress_mae(
-                np.asarray(base["pred_stress_eVA3"], dtype=float),
-                np.asarray(cand["pred_stress_eVA3"], dtype=float),
-            )
+        metric_keys = [
+            "energy_abs_error_eV",
+            "energy_abs_error_per_atom_eV",
+            "force_mae_eVA",
+            "force_rmse_eVA",
+            "stress_mae_eVA3",
+            "stress_rmse_eVA3",
+            "peak_mem_mb",
+        ]
+        for metric_key in metric_keys:
+            if metric_key in base and metric_key in cand:
+                baseline_value = float(base[metric_key])
+                candidate_value = float(cand[metric_key])
+                row[f"{metric_key}_baseline"] = baseline_value
+                row[f"{metric_key}_candidate"] = candidate_value
+                row[f"{metric_key}_delta"] = candidate_value - baseline_value
+                row[f"{metric_key}_ratio"] = (
+                    candidate_value / baseline_value if baseline_value != 0 else None
+                )
 
         rows.append(row)
     return rows
 
 
-def nsites_bin(nsites: int) -> str:
-    if nsites <= 4:
+def n_atoms_bin(n_atoms: int) -> str:
+    if n_atoms <= 4:
         return "small(<=4)"
-    if nsites <= 16:
+    if n_atoms <= 16:
         return "medium(5-16)"
-    if nsites <= 32:
+    if n_atoms <= 32:
         return "large(17-32)"
     return "xlarge(>32)"
 
@@ -120,36 +113,35 @@ def summarize_rows(rows: list[dict]) -> dict:
         "speedup_vs_baseline": float(baseline_latency.mean() / candidate_latency.mean())
         if candidate_latency.mean() > 0
         else None,
-        "energy_mae_delta_meV_per_atom": float(
-            np.mean([r["energy_abs_delta_meV_per_atom"] for r in rows])
+        "pred_energy_mae_delta_meV_per_atom": float(
+            np.mean([r["pred_energy_abs_delta_meV_per_atom"] for r in rows])
         ),
     }
 
-    if "force_mae" in rows[0]:
-        out["force_mae_delta_eVA"] = float(np.mean([r["force_mae"] for r in rows]))
-        out["force_rmse_delta_eVA"] = float(np.mean([r["force_rmse"] for r in rows]))
-        out["max_force_error_eVA"] = float(np.max([r["max_force_error"] for r in rows]))
-        out["p95_force_error_eVA"] = float(np.mean([r["p95_force_error"] for r in rows]))
-        out["p99_force_error_eVA"] = float(np.mean([r["p99_force_error"] for r in rows]))
-
-    if "stress_mae_eVA3" in rows[0]:
-        out["stress_mae_delta_eVA3"] = float(np.mean([r["stress_mae_eVA3"] for r in rows]))
+    for metric_key in [
+        "energy_abs_error_per_atom_eV",
+        "force_mae_eVA",
+        "force_rmse_eVA",
+        "stress_mae_eVA3",
+        "stress_rmse_eVA3",
+        "peak_mem_mb",
+    ]:
+        delta_key = f"{metric_key}_delta"
+        ratio_key = f"{metric_key}_ratio"
+        if delta_key in rows[0]:
+            out[f"{metric_key}_delta_mean"] = float(np.mean([r[delta_key] for r in rows]))
+            ratios = [r[ratio_key] for r in rows if r.get(ratio_key) is not None]
+            out[f"{metric_key}_ratio_mean"] = float(np.mean(ratios)) if ratios else None
 
     return out
 
 
 def summarize_by_group(rows: list[dict]) -> dict:
     group_maps = {
-        "structure_role": defaultdict(list),
-        "nsites_bin": defaultdict(list),
-        "crystal_system": defaultdict(list),
-        "is_magnetic": defaultdict(list),
+        "n_atoms_bin": defaultdict(list),
     }
     for row in rows:
-        group_maps["structure_role"][row["structure_role"]].append(row)
-        group_maps["nsites_bin"][nsites_bin(int(row["nsites"]))].append(row)
-        group_maps["crystal_system"][row["crystal_system"]].append(row)
-        group_maps["is_magnetic"][str(row["is_magnetic"])].append(row)
+        group_maps["n_atoms_bin"][n_atoms_bin(int(row["n_atoms"]))].append(row)
 
     summary = {}
     for group_name, mapping in group_maps.items():

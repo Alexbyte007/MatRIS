@@ -1,5 +1,4 @@
 import argparse
-import csv
 import json
 import math
 import random
@@ -8,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from ase.io import read as ase_read
+from fairchem.core.datasets import AseDBDataset
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -20,15 +19,20 @@ from matris.applications.base import MatRISCalculator
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Lightweight force-consistency checks: random perturbation + finite difference."
+        description="OMAT24 force-consistency checks: random perturbation + finite difference."
     )
-    parser.add_argument("--metadata-csv", required=True)
+    parser.add_argument(
+        "--dataset-src",
+        default="/home/lht/lab/omat24/val/rattled-relax",
+        help="Path to OMAT24 split directory containing data.aselmdb.",
+    )
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--model", default="matris_10m_oam")
     parser.add_argument("--task", default="ef", choices=("ef", "efs"))
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--precision-mode", default="fp32", choices=("fp32", "tf32", "bf16", "fp16"))
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--sample-seed", type=int, default=20260424)
     parser.add_argument("--fd-step-ang", type=float, default=1e-3)
     parser.add_argument("--perturb-std-ang", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
@@ -56,6 +60,15 @@ def autocast_context(device: str, precision_mode: str):
 
 def build_calculator(args: argparse.Namespace) -> MatRISCalculator:
     return MatRISCalculator(model=args.model, task=args.task, device=args.device)
+
+
+def select_indices(dataset_len: int, limit: int, seed: int) -> list[int]:
+    if limit <= 0 or limit >= dataset_len:
+        return list(range(dataset_len))
+    rng = random.Random(seed)
+    indices = rng.sample(range(dataset_len), limit)
+    indices.sort()
+    return indices
 
 
 def predict(atoms, calc: MatRISCalculator, args: argparse.Namespace) -> tuple[float, np.ndarray]:
@@ -119,34 +132,38 @@ def main() -> None:
 
     configure_precision(args.device, args.precision_mode)
     calc = build_calculator(args)
-
-    with open(args.metadata_csv, "r", encoding="utf-8") as fp:
-        rows = list(csv.DictReader(fp))[: args.limit]
+    dataset = AseDBDataset(config={"src": args.dataset_src})
+    indices = select_indices(len(dataset), args.limit, args.sample_seed)
 
     rng = random.Random(args.seed)
     np_rng = np.random.default_rng(args.seed)
 
     records = []
-    for idx, row in enumerate(rows, start=1):
-        atoms = ase_read(row["cif_path"])
+    for idx, sample_index in enumerate(indices, start=1):
+        item = dataset[sample_index]
+        atoms = dataset.get_atoms(sample_index)
         fd = finite_difference_check(atoms, calc, args, rng)
         pert = random_perturbation_check(atoms, calc, args, np_rng)
         record = {
-            "material_id": row.get("material_id", ""),
-            "structure_role": row.get("structure_role", ""),
-            "cif_path": row.get("cif_path", ""),
+            "sample_index": sample_index,
+            "sid": item["sid"] if "sid" in item else "",
+            "formula": atoms.get_chemical_formula(),
+            "n_atoms": len(atoms),
             **fd,
             **pert,
         }
         records.append(record)
         print(
-            f"[{idx}/{len(rows)}] {record['material_id']} "
+            f"[{idx}/{len(indices)}] sample_index={sample_index} formula={record['formula']} "
             f"fd_abs_error={record['fd_abs_error_eVA']:.6e} eV/A "
             f"force_change_mae={record['force_change_mae_eVA']:.6e} eV/A"
         )
 
     summary = {
         "num_structures": len(records),
+        "dataset_src": str(Path(args.dataset_src).resolve()),
+        "dataset_size": len(dataset),
+        "sample_seed": args.sample_seed,
         "fd_abs_error_eVA_mean": float(np.mean([r["fd_abs_error_eVA"] for r in records])) if records else 0.0,
         "fd_abs_error_eVA_max": float(np.max([r["fd_abs_error_eVA"] for r in records])) if records else 0.0,
         "force_change_mae_eVA_mean": float(np.mean([r["force_change_mae_eVA"] for r in records])) if records else 0.0,
