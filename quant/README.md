@@ -72,6 +72,67 @@ print(cfg["targets"])
 PY
 ```
 
-In a full MatRIS evaluation environment, also run a small CUDA sample with
-activation calibration to confirm model loading, quantized replacement,
-GatedMLP fusion, and force/stress autograd all execute successfully.
+## P8E Test Commands
+
+Set the dataset path once before running the CUDA tests:
+
+```bash
+export MATRIS_DATASET_SRC=/path/to/sAlex/val
+export MATRIS_FREEZE_MODEL_PARAMS_FOR_EFS=1
+export MATRIS_W8A8_BACKEND=cuda_wmma_tail_n128
+```
+
+Smoke test the real MatRIS path on one sAlex sample. This checks model loading,
+quantized replacement, GatedMLP fusion, activation calibration, and E/F/S
+autograd:
+
+```bash
+MATRIS_DATASET_SRC="${MATRIS_DATASET_SRC}" \
+MATRIS_ALIGNMENT_STRICT_ASSERT=0 \
+MATRIS_BASELINE_W8A8_BACKEND=cuda_wmma_tail_n128 \
+MATRIS_CANDIDATE_W8A8_BACKEND=cuda_wmma_tail_n128 \
+MATRIS_ALIGNMENT_SAMPLE_INDEX=26225 \
+MATRIS_ALIGNMENT_OUTPUT=results/p8e_submit_sanity/w8a8_backend_same_backend_alignment.json \
+python test/eval/check_w8a8_backend_matris_alignment.py
+```
+
+Run a small runtime profile:
+
+```bash
+python test/eval/profile_salex_pipeline.py \
+  --dataset-src "${MATRIS_DATASET_SRC}" \
+  --output-dir results/p8e_profile_smoke \
+  --model matris_10m_oam \
+  --task efs \
+  --device cuda \
+  --precision-mode fp32 \
+  --quant-mode p8d_refine_w8a8_attn_line_core_gate_second_blocks_8_9_w8a8 \
+  --fusion-mode line_edge_gated_mlp_second_tail_fused_fp32 \
+  --activation-calibration-limit 64 \
+  --activation-calibration-seed 43 \
+  --limit 10 \
+  --warmup-steps 2 \
+  --combined-force-stress-autograd
+```
+
+Run a small precision check:
+
+```bash
+python test/eval/evaluate_salex_static_metrics.py \
+  --dataset-src "${MATRIS_DATASET_SRC}" \
+  --output-dir results/p8e_precision_smoke \
+  --model matris_10m_oam \
+  --task efs \
+  --device cuda \
+  --precision-mode fp32 \
+  --quant-mode p8d_refine_w8a8_attn_line_core_gate_second_blocks_8_9_w8a8 \
+  --fusion-mode line_edge_gated_mlp_second_tail_fused_fp32 \
+  --activation-calibration-limit 64 \
+  --activation-calibration-seed 43 \
+  --limit 50 \
+  --warmup-steps 3
+```
+
+For a formal comparison, increase the precision `--limit` to the same sample
+count used by the baseline run and compare against an FP32 run with
+`--quant-mode none --fusion-mode none`.
