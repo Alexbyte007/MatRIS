@@ -1,6 +1,7 @@
 import torch
 from matris.graph import RadiusGraph
 from collections.abc import Sequence
+from matris.model.functions import edge_vectors_or_none, use_precomputed_aggregate_bincount
 
     
 def process_graphs(graphs: Sequence[RadiusGraph], 
@@ -191,10 +192,18 @@ def process_graphs(graphs: Sequence[RadiusGraph],
     # node index
     target_index, source_index  = batched_atom_graph[:, 0], batched_atom_graph[:, 1]
     # ===== compute pairwise distance and edge vectors =====
-    center_pos = batch_cart_coords[target_index] 
-    neighbor_pos = batch_cart_coords[source_index]
-    neighbor_pos = neighbor_pos + batch_image @ batch_lattice
-    edge_vectors = center_pos - neighbor_pos
+    edge_vectors = edge_vectors_or_none(
+        batch_cart_coords,
+        batch_lattice,
+        batch_image,
+        target_index,
+        source_index,
+    )
+    if edge_vectors is None:
+        center_pos = batch_cart_coords[target_index] 
+        neighbor_pos = batch_cart_coords[source_index]
+        neighbor_pos = neighbor_pos + batch_image @ batch_lattice
+        edge_vectors = center_pos - neighbor_pos
     edge_lengths = torch.norm(edge_vectors, dim=1) # pairwise distance
     unit_edge_vectors = edge_vectors / edge_lengths[:, None] # edge vectors
     
@@ -206,6 +215,19 @@ def process_graphs(graphs: Sequence[RadiusGraph],
     batched_graph['atoms_per_graph'] = atoms_per_graph # List, size:[atoms]
     batched_graph['directed2undirected'] = directed2undirected.to(torch.int64) #[direct_edge_num]
     batched_graph['undirected2directed'] = undirected2directed.to(torch.int64) #[undirect_edge_num]
+    directed2undirected_bincount = None
+    if use_precomputed_aggregate_bincount():
+        # directed2undirected maps each directed edge to one undirected edge.
+        # MatRIS builds symmetric directed pairs, so every undirected edge has
+        # exactly two directed contributors. Avoid a runtime CUDA bincount here;
+        # this path is mainly used to make aggregate metadata capture-friendly.
+        directed2undirected_bincount = torch.full(
+            (batched_graph['undirected2directed'].shape[0],),
+            2,
+            dtype=batched_graph['directed2undirected'].dtype,
+            device=batched_graph['directed2undirected'].device,
+        )
+        batched_graph['directed2undirected_bincount'] = directed2undirected_bincount
     batched_graph['volumes'] = volumes # [num_graphs, 1, 1]
     batched_graph['lattice'] = batch_lattice # [num_graphs*3, 3]
     batched_graph['batch_cart_coords'] = batch_cart_coords # [atoms, 3]
@@ -223,6 +245,8 @@ def process_graphs(graphs: Sequence[RadiusGraph],
     bincount_target_atom_graph = bincount_target_atom_graph.where(bincount_target_atom_graph != 0, bincount_target_atom_graph.new_ones(1))
     atom_graph_dict['source_bincount'] = bincount_source_atom_graph
     atom_graph_dict['target_bincount'] = bincount_target_atom_graph
+    if directed2undirected_bincount is not None:
+        atom_graph_dict['directed2undirected_bincount'] = directed2undirected_bincount
     
     line_graph_dict['line_graph'] = batch_line_graph_compress
     if len(line_graph_dict['line_graph']) != 0:
@@ -243,4 +267,3 @@ def process_graphs(graphs: Sequence[RadiusGraph],
     batched_graph['line_graph_dict'] = line_graph_dict
     
     return batched_graph
-

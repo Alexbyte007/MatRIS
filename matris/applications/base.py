@@ -1,6 +1,7 @@
 from ase import Atoms, units
 from ase.calculators.calculator import Calculator, all_changes, all_properties
 import numpy as np
+import torch
 
 from ..model.model import MatRIS
 
@@ -107,7 +108,10 @@ class MatRISCalculator(Calculator):
         
         for key in self.key & set(model_prediction.keys()):
             for idx, tensor in enumerate(model_prediction[key]):
-                model_predictions[key] = tensor.cpu().detach().numpy()
+                export_tensor = tensor.detach()
+                if export_tensor.dtype == torch.bfloat16:
+                    export_tensor = export_tensor.to(torch.float32)
+                model_predictions[key] = export_tensor.cpu().numpy()
         
         # Convert Result
         n_atoms = 1 if not self.model.is_intensive else structure.composition.num_atoms

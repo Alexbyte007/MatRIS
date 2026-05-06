@@ -11,7 +11,13 @@ from .basis_function import (
     SphericalExpansion,
     SinusoidalTimeExpansion
 )
-from .functions import get_normalization, SwishLayer, aggregate
+from .functions import (
+    get_normalization,
+    SwishLayer,
+    aggregate,
+    use_directed2undirected_select_fastpath,
+    use_precomputed_aggregate_bincount,
+)
 
 class AtomTypeEmbedding(nn.Module):
     """Encode an atom by its atomic number using 'nn.Embedding'."""
@@ -136,12 +142,24 @@ class EdgeBasisEmbedding(nn.Module):
         edge_feat_direct = torch.index_select(edge_feat_undirect, 0, graphs['directed2undirected'])
         edge_feat_direct = self.edge_linear2(edge_feat_direct)
         edge_feat_direct = self.edge_init_norm(edge_feat_direct)
-        # Aggregate to bond_feas_ude
-        edge_feat = aggregate(data=edge_feat_direct, 
-                                                 segment=graphs['directed2undirected'],
-                                                 bin_count=None, 
-                                                 average=True, 
-                                                 num_segment=None)
+        # Aggregate to bond_feas_ude.  The two directed rows of each undirected
+        # edge are constructed from the same undirected feature and transformed
+        # by row-wise modules, so their average is equivalent to selecting the
+        # representative directed row.
+        if use_directed2undirected_select_fastpath():
+            edge_feat = torch.index_select(edge_feat_direct, 0, graphs['undirected2directed'])
+        else:
+            directed2undirected_bincount = (
+                graphs.get('directed2undirected_bincount')
+                if use_precomputed_aggregate_bincount()
+                else None
+            )
+            edge_feat = aggregate(data=edge_feat_direct,
+                                                     segment=graphs['directed2undirected'],
+                                                     bin_count=directed2undirected_bincount,
+                                                     average=True,
+                                                     num_segment=None,
+                                                     profile_name="feature_embed.directed2undirected_edge_average")
         edge_feat = self.swish_layer(edge_feat)
         smooth_weight={"atom graph": pairwise_rbf, "line graph": threebody_rbf}
         #return edge_feat, pairwise_rbf, threebody_rbf

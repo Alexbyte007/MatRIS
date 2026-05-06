@@ -150,6 +150,8 @@ class MatRIS(nn.Module):
             for _ in range(num_layers)
         ]
         self.interaction_block = nn.ModuleList(interaction_block)
+        for idx, block in enumerate(self.interaction_block):
+            block.profile_prefix = f"interaction_block.{idx}"
 
         # ====== Readout layers ======== 
         self.readout_norm = get_normalization(norm_type, dim=node_feat_dim)

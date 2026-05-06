@@ -13,6 +13,7 @@ from .functions import (
     Sphere,
     aggregate,
     get_activation,
+    use_precomputed_aggregate_bincount,
 )
 
 class EnergyHead(nn.Module):
@@ -245,6 +246,11 @@ class ForceStressHead(nn.Module):
 
                 force = aggregate(
                     direct_edge_feas, batch_graph['atom_graph_dict']['target_index'],
+                    bin_count=(
+                        batch_graph['atom_graph_dict'].get('target_bincount')
+                        if use_precomputed_aggregate_bincount()
+                        else None
+                    ),
                     average=False, 
                     num_segment=len(node_feat)
                 ) # [N_atoms, 3]

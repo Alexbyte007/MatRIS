@@ -9,6 +9,15 @@ from .functions import (
     aggregate,
     get_normalization,
     Dimwise_softmax,
+    cached_fused_attention_weight_linear_or_none,
+    directed2undirected_average_or_none,
+    fused_attention_weight_linear_or_none,
+    graph_feature_construction_or_none,
+    line_attention_fused_feature_first_linear_or_none,
+    fused_line_attention_or_none,
+    line_refine_smooth_agg_or_none,
+    segment_softmax_weighted_sum_sorted_or_none,
+    use_precomputed_aggregate_bincount,
 )
 from torch.utils.checkpoint import checkpoint
 
@@ -92,9 +101,6 @@ class Graph_Attention_Layer(nn.Module):
     ): 
         source_node_index = graph['source_index']
         target_node_index = graph['target_index']
-        # gather
-        source_node_feat = torch.index_select(node_feat, 0, source_node_index)
-        target_node_feat = torch.index_select(node_feat, 0, target_node_index)
         if directed2undirected is not None:
             # Atom Graph Update
             edge_feat_0 = torch.index_select(edge_feat, 0, directed2undirected) # [edge, dim] -> [2*edge, dim]
@@ -102,36 +108,149 @@ class Graph_Attention_Layer(nn.Module):
             # Line Graph Update
             edge_feat_0 = edge_feat
 
+        profile_prefix = getattr(self, "profile_prefix", self.__class__.__name__)
         #======= combine feature =======
-        attn_edge_feat = torch.cat([edge_feat_0, target_node_feat, source_node_feat], dim=1)
-        attn_edge_feat = self.edge_nonlinear_update(attn_edge_feat)
+        fused_attn_edge_update = line_attention_fused_feature_first_linear_or_none(
+            edge_feat_0,
+            node_feat,
+            target_node_index,
+            source_node_index,
+            self.edge_nonlinear_update,
+            enable_hint=directed2undirected is None and profile_prefix.endswith(".attn_line"),
+        )
+        if fused_attn_edge_update is None:
+            fused_attn_edge_feat = graph_feature_construction_or_none(
+                edge_feat_0,
+                node_feat,
+                target_node_index,
+                source_node_index,
+                enable_hint=directed2undirected is None and profile_prefix.endswith(".attn_line"),
+            )
+        else:
+            fused_attn_edge_feat = None
+        if fused_attn_edge_update is None and fused_attn_edge_feat is None:
+            # gather
+            source_node_feat = torch.index_select(node_feat, 0, source_node_index)
+            target_node_feat = torch.index_select(node_feat, 0, target_node_index)
+            attn_edge_feat = torch.cat([edge_feat_0, target_node_feat, source_node_feat], dim=1)
+            attn_edge_feat = self.edge_nonlinear_update(attn_edge_feat)
+        elif fused_attn_edge_update is None:
+            attn_edge_feat = fused_attn_edge_feat
+            attn_edge_feat = self.edge_nonlinear_update(attn_edge_feat)
+        else:
+            attn_edge_feat = fused_attn_edge_update
 
-        # ======= update atom feature ======= 
-        source_alpha_0 = self.source_weight_linear(edge_feat_0)
-        target_alpha_0 = self.target_weight_linear(edge_feat_0)
-        
+        # ======= update atom feature =======
+        fused_attention_weight_linear = cached_fused_attention_weight_linear_or_none(
+            edge_feat_0,
+            self.source_weight_linear,
+            self.target_weight_linear,
+            enable_hint=(
+                profile_prefix.endswith(".attn_line")
+                or profile_prefix.endswith(".attn_atom")
+            ),
+        )
+        if fused_attention_weight_linear is None:
+            fused_attention_weight_linear = fused_attention_weight_linear_or_none(
+                edge_feat_0,
+                self.source_weight_linear,
+                self.target_weight_linear,
+                enable_hint=(
+                    profile_prefix.endswith(".attn_line")
+                    or profile_prefix.endswith(".attn_atom")
+                ),
+            )
+        if fused_attention_weight_linear is None:
+            source_alpha_0 = self.source_weight_linear(edge_feat_0)
+            target_alpha_0 = self.target_weight_linear(edge_feat_0)
+        else:
+            source_alpha_0, target_alpha_0 = fused_attention_weight_linear
+
         # Softmax
         num_segment = None #torch.unique(source_node_index).numel()
-        source_alpha = Dimwise_softmax(source_alpha_0, source_node_index, num_segment)
-        target_alpha = Dimwise_softmax(target_alpha_0, target_node_index, num_segment)
-        
-        source_weight = source_alpha * attn_edge_feat # refer to sa_{ij} * e'_{ij} in MatRIS paper
-        target_weight = target_alpha * attn_edge_feat # refer to ta_{ij} * e'_{ij} in MatRIS paper
+        fused_line_attention = fused_line_attention_or_none(
+            source_alpha_0,
+            target_alpha_0,
+            attn_edge_feat,
+            source_node_index,
+            target_node_index,
+            len(node_feat),
+            enable_hint=(
+                (directed2undirected is None and profile_prefix.endswith(".attn_line"))
+                or (directed2undirected is not None and profile_prefix.endswith(".attn_atom"))
+            ),
+            atom_graph=directed2undirected is not None,
+        )
+        if fused_line_attention is None:
+            source_alpha = Dimwise_softmax(
+                source_alpha_0,
+                source_node_index,
+                num_segment,
+                profile_name=f"{profile_prefix}.source_softmax",
+            )
+            target_alpha = Dimwise_softmax(
+                target_alpha_0,
+                target_node_index,
+                num_segment,
+                profile_name=f"{profile_prefix}.target_softmax",
+                bin_count=graph.get("target_bincount"),
+            )
+            
+            source_weight = source_alpha * attn_edge_feat # refer to sa_{ij} * e'_{ij} in MatRIS paper
+            target_attention_sum = segment_softmax_weighted_sum_sorted_or_none(
+                target_alpha_0,
+                attn_edge_feat,
+                target_node_index,
+                len(node_feat),
+                enable_hint=graph.get("target_bincount") is not None,
+            )
+            if target_attention_sum is None:
+                target_weight = target_alpha * attn_edge_feat # refer to ta_{ij} * e'_{ij} in MatRIS paper
+            else:
+                target_weight = None
+        else:
+            attn_source_feat, attn_target_feat = fused_line_attention
         
         if directed2undirected is not None:
-            attn_edge_feat = aggregate(data=attn_edge_feat, segment=directed2undirected, bin_count=None, average=True, num_segment=None) #[2*edge, dim] -> [edge, dim]
+            directed_average = directed2undirected_average_or_none(
+                attn_edge_feat,
+                directed2undirected,
+                edge_feat.shape[0],
+                enable_hint=True,
+            )
+            if directed_average is None:
+                attn_edge_feat = aggregate(
+                    data=attn_edge_feat,
+                    segment=directed2undirected,
+                    bin_count=(
+                        graph.get("directed2undirected_bincount")
+                        if use_precomputed_aggregate_bincount()
+                        else None
+                    ),
+                    average=True,
+                    num_segment=None,
+                    profile_name=f"{profile_prefix}.directed2undirected_edge_average",
+                ) #[2*edge, dim] -> [edge, dim]
+            else:
+                attn_edge_feat = directed_average
         # Compute Attention output
-        attn_source_feat = aggregate(data=source_weight, 
-                                     segment=source_node_index, 
-                                     bin_count=graph['source_bincount'],#bincount_source, 
-                                     average=False, 
-                                     num_segment=len(node_feat)) 
+        if fused_line_attention is None:
+            attn_source_feat = aggregate(data=source_weight, 
+                                         segment=source_node_index, 
+                                         bin_count=graph['source_bincount'],#bincount_source, 
+                                         average=False, 
+                                         num_segment=len(node_feat),
+                                         profile_name=f"{profile_prefix}.source_weight_sum") 
 
-        attn_target_feat = aggregate(data=target_weight, 
-                                     segment=target_node_index, 
-                                     bin_count=graph['target_bincount'],#bincount_target, 
-                                     average=False, 
-                                     num_segment=len(node_feat)) 
+            if target_attention_sum is None:
+                attn_target_feat = aggregate(data=target_weight,
+                                             segment=target_node_index,
+                                             bin_count=graph['target_bincount'],#bincount_target,
+                                             average=False,
+                                             num_segment=len(node_feat),
+                                             profile_name=f"{profile_prefix}.target_weight_sum")
+            else:
+                attn_target_feat = target_attention_sum
 
         fusion_node_feat = torch.cat([node_feat, attn_target_feat, attn_source_feat], dim=1)
         attn_node_feat = self.node_nonlinear_update(fusion_node_feat)
@@ -251,14 +370,36 @@ class Refinement(nn.Module):
             refine_fusion_feat = torch.cat([edge_feat_0, three_body_atom_feat, target_node_feat, source_node_feat], dim=1) 
         
         # Nonlinear            
+        profile_prefix = getattr(self, "profile_prefix", self.__class__.__name__)
         refine_fusion_feat_nonlinear = self.edge_nonlinear_update(refine_fusion_feat)
-        refine_fusion_feat_smooth = refine_fusion_feat_nonlinear * smooth_weight 
-         
-        refine_node_feas = aggregate(refine_fusion_feat_smooth, 
-                                     graph['target_index'], 
-                                     graph['target_bincount'],
-                                     average=False, 
-                                     num_segment=len(node_feat))
+        if is_atom_graph:
+            refine_fusion_feat_smooth = refine_fusion_feat_nonlinear * smooth_weight
+            refine_node_feas = aggregate(refine_fusion_feat_smooth,
+                                         graph['target_index'],
+                                         graph['target_bincount'],
+                                         average=False,
+                                         num_segment=len(node_feat),
+                                         profile_name=f"{profile_prefix}.target_smooth_sum")
+        else:
+            fused_refine_node_feas = line_refine_smooth_agg_or_none(
+                refine_fusion_feat_nonlinear,
+                smooth_weight,
+                graph['target_index'],
+                graph['target_bincount'],
+                len(node_feat),
+                enable_hint=profile_prefix.endswith(".refine_line"),
+            )
+            if fused_refine_node_feas is None:
+                refine_fusion_feat_smooth = refine_fusion_feat_nonlinear * smooth_weight
+                refine_node_feas = aggregate(refine_fusion_feat_smooth,
+                                             graph['target_index'],
+                                             graph['target_bincount'],
+                                             average=False,
+                                             num_segment=len(node_feat),
+                                             profile_name=f"{profile_prefix}.target_smooth_sum")
+            else:
+                refine_fusion_feat_smooth = None
+                refine_node_feas = fused_refine_node_feas
 
         input2edgeFFN = (
             refine_fusion_feat_smooth
@@ -270,7 +411,27 @@ class Refinement(nn.Module):
         delta_edge_feat = self.edge_FFN(input2edgeFFN)
         
         if is_atom_graph:  
-            delta_edge_feat = aggregate(data=delta_edge_feat, segment=directed2undirected, bin_count=None, average=True, num_segment=None) # [2*edge, dim] -> [edge, dim]
+            directed_average = directed2undirected_average_or_none(
+                delta_edge_feat,
+                directed2undirected,
+                edge_feat.shape[0],
+                enable_hint=True,
+            )
+            if directed_average is None:
+                delta_edge_feat = aggregate(
+                    data=delta_edge_feat,
+                    segment=directed2undirected,
+                    bin_count=(
+                        graph.get("directed2undirected_bincount")
+                        if use_precomputed_aggregate_bincount()
+                        else None
+                    ),
+                    average=True,
+                    num_segment=None,
+                    profile_name=f"{profile_prefix}.directed2undirected_delta_average",
+                ) # [2*edge, dim] -> [edge, dim]
+            else:
+                delta_edge_feat = directed_average
 
         update_node_feat = delta_node_feat + self.node_res_weight * node_feat
         update_edge_feat = delta_edge_feat + self.edge_res_weight * edge_feat
@@ -403,7 +564,9 @@ class Interaction_Block(nn.Module):
         )
 
         # Process line graph (bond graph) with attention if threebody features exist
+        profile_prefix = getattr(self, "profile_prefix", self.__class__.__name__)
         if threebody_feat is not None: 
+            self.attn_block_line_graph.profile_prefix = f"{profile_prefix}.attn_line"
             attn_edge_feat, attn_threebody_feat = self.wrapper_attn_layer(
                 attn_layer=self.attn_block_line_graph,
                 node_feat=edge_feat,
@@ -411,8 +574,9 @@ class Interaction_Block(nn.Module):
                 graph=batch_graph['line_graph_dict'],
                 use_checkpoint=use_checkpoint, 
             )
-
+        
         # Process atom graph with attention
+        self.attn_block_atom_graph.profile_prefix = f"{profile_prefix}.attn_atom"
         attn_node_feat, attn_edge_feat = self.wrapper_attn_layer(
             attn_layer=self.attn_block_atom_graph,
             node_feat=node_feat, 
@@ -423,6 +587,7 @@ class Interaction_Block(nn.Module):
         
         # Refine line graph features if threebody features exist
         if threebody_feat is not None:
+            self.refine_block_line_graph.profile_prefix = f"{profile_prefix}.refine_line"
             update_edge_feat, update_threebody_feat = self.wrapper_refine_layer(
                 refine_layer=self.refine_block_line_graph,
                 node_feat=attn_edge_feat,
@@ -434,6 +599,7 @@ class Interaction_Block(nn.Module):
             )
         
         # Refine atom graph features
+        self.refine_block_atom_graph.profile_prefix = f"{profile_prefix}.refine_atom"
         update_node_feat, update_edge_feat = self.wrapper_refine_layer(
             refine_layer=self.refine_block_atom_graph,
             node_feat=attn_node_feat,
