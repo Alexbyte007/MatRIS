@@ -37,7 +37,15 @@ For E/F/S evaluation where model parameters are frozen, use:
 ```bash
 export MATRIS_FREEZE_MODEL_PARAMS_FOR_EFS=1
 export MATRIS_W8A8_BACKEND=cuda_wmma_tail_n128
+export MATRIS_USE_CUDA_FUSED_LINE_ATTENTION=1
+export MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION=1
+export MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE=1
 ```
+
+The three `MATRIS_USE_CUDA_*` flags above are part of the stable fast runtime
+path used by the P8E profile. Without them, the quantized mode still runs, but
+the interaction/autograd stages fall back to slower attention and aggregation
+paths.
 
 The quantized linear layers need activation calibration before the measured
 evaluation pass. The existing evaluation/profile utilities call
@@ -80,6 +88,9 @@ Set the dataset path once before running the CUDA tests:
 export MATRIS_DATASET_SRC=/path/to/sAlex/val
 export MATRIS_FREEZE_MODEL_PARAMS_FOR_EFS=1
 export MATRIS_W8A8_BACKEND=cuda_wmma_tail_n128
+export MATRIS_USE_CUDA_FUSED_LINE_ATTENTION=1
+export MATRIS_USE_CUDA_FUSED_ATOM_ATTENTION=1
+export MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE=1
 ```
 
 Smoke test the real MatRIS path on one sAlex sample. This checks model loading,
