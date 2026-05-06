@@ -96,12 +96,29 @@ MATRIS_ALIGNMENT_OUTPUT=results/p8e_submit_sanity/w8a8_backend_same_backend_alig
 python test/eval/check_w8a8_backend_matris_alignment.py
 ```
 
-Run a small runtime profile:
+Run the FP32 runtime baseline on 500 samples:
 
 ```bash
 python test/eval/profile_salex_pipeline.py \
   --dataset-src "${MATRIS_DATASET_SRC}" \
-  --output-dir results/p8e_profile_smoke \
+  --output-dir results/fp32_profile_limit500 \
+  --model matris_10m_oam \
+  --task efs \
+  --device cuda \
+  --precision-mode fp32 \
+  --quant-mode none \
+  --fusion-mode none \
+  --limit 500 \
+  --warmup-steps 50 \
+  --combined-force-stress-autograd
+```
+
+Run the P8E runtime profile on 500 samples:
+
+```bash
+python test/eval/profile_salex_pipeline.py \
+  --dataset-src "${MATRIS_DATASET_SRC}" \
+  --output-dir results/p8e_profile_limit500 \
   --model matris_10m_oam \
   --task efs \
   --device cuda \
@@ -110,17 +127,33 @@ python test/eval/profile_salex_pipeline.py \
   --fusion-mode line_edge_gated_mlp_second_tail_fused_fp32 \
   --activation-calibration-limit 64 \
   --activation-calibration-seed 43 \
-  --limit 10 \
-  --warmup-steps 2 \
+  --limit 500 \
+  --warmup-steps 50 \
   --combined-force-stress-autograd
 ```
 
-Run a small precision check:
+Run the FP32 precision baseline on 500 samples:
 
 ```bash
 python test/eval/evaluate_salex_static_metrics.py \
   --dataset-src "${MATRIS_DATASET_SRC}" \
-  --output-dir results/p8e_precision_smoke \
+  --output-dir results/fp32_precision_limit500 \
+  --model matris_10m_oam \
+  --task efs \
+  --device cuda \
+  --precision-mode fp32 \
+  --quant-mode none \
+  --fusion-mode none \
+  --limit 500 \
+  --warmup-steps 3
+```
+
+Run the P8E precision check on 500 samples:
+
+```bash
+python test/eval/evaluate_salex_static_metrics.py \
+  --dataset-src "${MATRIS_DATASET_SRC}" \
+  --output-dir results/p8e_precision_limit500 \
   --model matris_10m_oam \
   --task efs \
   --device cuda \
@@ -129,10 +162,10 @@ python test/eval/evaluate_salex_static_metrics.py \
   --fusion-mode line_edge_gated_mlp_second_tail_fused_fp32 \
   --activation-calibration-limit 64 \
   --activation-calibration-seed 43 \
-  --limit 50 \
+  --limit 500 \
   --warmup-steps 3
 ```
 
-For a formal comparison, increase the precision `--limit` to the same sample
-count used by the baseline run and compare against an FP32 run with
-`--quant-mode none --fusion-mode none`.
+Compare the P8E profile summary against the FP32 profile summary for speedup.
+Compare the P8E precision summary against the FP32 precision summary for force
+and stress error.
