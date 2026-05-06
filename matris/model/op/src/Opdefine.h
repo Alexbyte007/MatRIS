@@ -266,13 +266,4 @@ std::vector<torch::Tensor> fused_line_attention_backward(const torch::Tensor &gr
                                                          const torch::Tensor &source_index,
                                                          const torch::Tensor &target_index);
 
-std::vector<torch::Tensor> fused_gated_mlp_tail_backward(const torch::Tensor &grad_out,
-                                                         const torch::Tensor &core_input,
-                                                         const torch::Tensor &gate_input,
-                                                         const torch::Tensor &core_norm_out,
-                                                         const torch::Tensor &gate_norm_out,
-                                                         const torch::Tensor &core_norm_weight,
-                                                         const torch::Tensor &gate_norm_weight,
-                                                         double eps);
-
 #endif  // OP_SRC_OPDECLARE_H_

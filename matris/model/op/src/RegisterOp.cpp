@@ -35,7 +35,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("edge_vectors_backward", &edge_vectors_backward, "edge_vectors_backward");
     m.def("fused_line_attention_forward", &fused_line_attention_forward, "fused_line_attention_forward");
     m.def("fused_line_attention_backward", &fused_line_attention_backward, "fused_line_attention_backward");
-    m.def("fused_gated_mlp_tail_backward", &fused_gated_mlp_tail_backward, "fused_gated_mlp_tail_backward");
 }
 
 TORCH_LIBRARY(matris_op, m)
@@ -73,5 +72,4 @@ TORCH_LIBRARY(matris_op, m)
     m.def("edge_vectors_backward", &edge_vectors_backward);
     m.def("fused_line_attention_forward", &fused_line_attention_forward);
     m.def("fused_line_attention_backward", &fused_line_attention_backward);
-    m.def("fused_gated_mlp_tail_backward", &fused_gated_mlp_tail_backward);
 }

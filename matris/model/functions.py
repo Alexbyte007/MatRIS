@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-
-import fnmatch
 import json
 import os
 import torch
@@ -1737,31 +1735,16 @@ class _CudaFusedGatedMLPTailFn(torch.autograd.Function):
             core_norm_weight,
             gate_norm_weight,
         ) = ctx.saved_tensors
-        try:
-            import matris_op  # type: ignore
-        except Exception:
-            return _CudaFusedGatedMLPTailFn._torch_backward(
-                grad_out,
-                core,
-                gate,
-                core_norm,
-                gate_norm,
-                core_norm_weight,
-                gate_norm_weight,
-                ctx.eps,
-            )
-
-        grad_core, grad_gate = matris_op.fused_gated_mlp_tail_backward(
-            grad_out.contiguous(),
+        return _CudaFusedGatedMLPTailFn._torch_backward(
+            grad_out,
             core,
             gate,
             core_norm,
             gate_norm,
             core_norm_weight,
             gate_norm_weight,
-            float(ctx.eps),
+            ctx.eps,
         )
-        return grad_core, grad_gate, None, None, None, None, None
 
     @staticmethod
     def _torch_backward(
@@ -1804,34 +1787,6 @@ class _CudaFusedGatedMLPTailFn(torch.autograd.Function):
         return grad_core, grad_gate, None, None, None, None, None
 
 
-def _cuda_input_grad_only_gated_tail_bwd_requested() -> bool:
-    return (
-        os.environ.get("MATRIS_USE_CUDA_INPUT_GRAD_ONLY_GATED_TAIL_BWD") == "1"
-        or os.environ.get("MATRIS_USE_CUDA_FUSED_GATED_TAIL_BWD") == "1"
-    )
-
-
-def _can_use_cuda_input_grad_only_gated_tail_bwd() -> bool:
-    return (
-        _cuda_input_grad_only_gated_tail_bwd_requested()
-        and os.environ.get("MATRIS_FREEZE_MODEL_PARAMS_FOR_EFS") == "1"
-    )
-
-
-def _cuda_input_grad_only_gated_tail_bwd_module_allowed(module_name: str) -> bool:
-    include_rules = os.environ.get("MATRIS_CUDA_INPUT_GRAD_ONLY_GATED_TAIL_BWD_MODULES", "").strip()
-    if include_rules:
-        patterns = [item.strip() for item in include_rules.replace(";", ",").split(",") if item.strip()]
-        if patterns and not any(fnmatch.fnmatch(module_name, pattern) for pattern in patterns):
-            return False
-    exclude_rules = os.environ.get("MATRIS_CUDA_INPUT_GRAD_ONLY_GATED_TAIL_BWD_EXCLUDE_MODULES", "").strip()
-    if exclude_rules:
-        patterns = [item.strip() for item in exclude_rules.replace(";", ",").split(",") if item.strip()]
-        if any(fnmatch.fnmatch(module_name, pattern) for pattern in patterns):
-            return False
-    return True
-
-
 class _W8ALowPrecisionSecondTailInputGradFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1857,10 +1812,7 @@ class _W8ALowPrecisionSecondTailInputGradFn(torch.autograd.Function):
         compute_dtype = core_weight.dtype
         core_low = core_input.to(compute_dtype)
         gate_low = gate_input.to(compute_dtype)
-        use_aux = (
-            os.environ.get("MATRIS_USE_W16A16_WHOLE_TAIL_DATAFLOW") == "1"
-            and hasattr(matris_op, "quant_linear_w8a_lowp_dual_cached_tail_forward_aux")
-        )
+        use_aux = False
         if use_aux:
             out, core_linear, gate_linear, core_norm, gate_norm = (
                 matris_op.quant_linear_w8a_lowp_dual_cached_tail_forward_aux(
@@ -1937,33 +1889,16 @@ class _W8ALowPrecisionSecondTailInputGradFn(torch.autograd.Function):
             core_norm_weight,
             gate_norm_weight,
         ) = ctx.saved_tensors
-        matris_op = _load_matris_op()
-        if (
-            _can_use_cuda_input_grad_only_gated_tail_bwd()
-            and matris_op is not None
-            and hasattr(matris_op, "fused_gated_mlp_tail_backward")
-        ):
-            grad_core_linear, grad_gate_linear = matris_op.fused_gated_mlp_tail_backward(
-                grad_out.contiguous(),
-                core_linear,
-                gate_linear,
-                core_norm,
-                gate_norm,
-                core_norm_weight,
-                gate_norm_weight,
-                float(ctx.eps),
-            )
-        else:
-            grad_core_linear, grad_gate_linear, *_ = _CudaFusedGatedMLPTailFn._torch_backward(
-                grad_out,
-                core_linear,
-                gate_linear,
-                core_norm,
-                gate_norm,
-                core_norm_weight,
-                gate_norm_weight,
-                float(ctx.eps),
-            )
+        grad_core_linear, grad_gate_linear, *_ = _CudaFusedGatedMLPTailFn._torch_backward(
+            grad_out,
+            core_linear,
+            gate_linear,
+            core_norm,
+            gate_norm,
+            core_norm_weight,
+            gate_norm_weight,
+            float(ctx.eps),
+        )
 
         compute_dtype = ctx.compute_dtype
         grad_core_input = grad_core_linear.to(compute_dtype).matmul(core_weight).float()
@@ -2044,33 +1979,16 @@ class _FP32SecondTailInputGradFn(torch.autograd.Function):
             core_norm_weight,
             gate_norm_weight,
         ) = ctx.saved_tensors
-        matris_op = _load_matris_op()
-        if (
-            _can_use_cuda_input_grad_only_gated_tail_bwd()
-            and matris_op is not None
-            and hasattr(matris_op, "fused_gated_mlp_tail_backward")
-        ):
-            grad_core_linear, grad_gate_linear = matris_op.fused_gated_mlp_tail_backward(
-                grad_out.contiguous(),
-                core_linear,
-                gate_linear,
-                core_norm,
-                gate_norm,
-                core_norm_weight,
-                gate_norm_weight,
-                float(ctx.eps),
-            )
-        else:
-            grad_core_linear, grad_gate_linear, *_ = _CudaFusedGatedMLPTailFn._torch_backward(
-                grad_out,
-                core_linear,
-                gate_linear,
-                core_norm,
-                gate_norm,
-                core_norm_weight,
-                gate_norm_weight,
-                float(ctx.eps),
-            )
+        grad_core_linear, grad_gate_linear, *_ = _CudaFusedGatedMLPTailFn._torch_backward(
+            grad_out,
+            core_linear,
+            gate_linear,
+            core_norm,
+            gate_norm,
+            core_norm_weight,
+            gate_norm_weight,
+            float(ctx.eps),
+        )
 
         grad_core_input = grad_core_linear.matmul(core_weight)
         grad_gate_input = grad_gate_linear.matmul(gate_weight)
@@ -2191,52 +2109,6 @@ class FusedGatedMLPTail(nn.Module):
         self.module_name = module_name
 
     def forward(self, core: Tensor, gate: Tensor) -> Tensor:
-        if (
-            _can_use_cuda_input_grad_only_gated_tail_bwd()
-            and _cuda_input_grad_only_gated_tail_bwd_module_allowed(self.module_name)
-            and not self.training
-            and torch.is_grad_enabled()
-            and core.is_cuda
-            and gate.is_cuda
-            and core.dtype == torch.float32
-            and gate.dtype == torch.float32
-            and core.ndim == 2
-            and gate.shape == core.shape
-            and isinstance(self.core_norm, nn.LayerNorm)
-            and isinstance(self.gate_norm, nn.LayerNorm)
-            and self.core_norm.normalized_shape == self.gate_norm.normalized_shape
-            and self.core_norm.eps == self.gate_norm.eps
-            and self.core_norm.elementwise_affine
-            and self.gate_norm.elementwise_affine
-            and isinstance(self.activation_func, FusedSiLU)
-            and isinstance(self.activation_gate, FusedSigmoid)
-        ):
-            min_rows = int(os.environ.get("MATRIS_FUSED_GATED_TAIL_BWD_MIN_ROWS", "0"))
-            rows = int(core.reshape(-1, core.shape[-1]).shape[0])
-            if rows < min_rows:
-                if os.environ.get("MATRIS_FUSED_GATED_TAIL_BWD_STATS") == "1":
-                    _record_gated_tail_bwd_stat("fallback_min_rows", rows, self.module_name)
-            else:
-                if os.environ.get("MATRIS_FUSED_GATED_TAIL_BWD_STATS") == "1":
-                    _record_gated_tail_bwd_stat("enabled", rows, self.module_name)
-                core = core.contiguous()
-                gate = gate.contiguous()
-                return _CudaFusedGatedMLPTailFn.apply(
-                    core,
-                    gate,
-                    self.core_norm.weight,
-                    self.core_norm.bias,
-                    self.gate_norm.weight,
-                    self.gate_norm.bias,
-                    self.core_norm.eps,
-                )
-        elif (
-            _can_use_cuda_input_grad_only_gated_tail_bwd()
-            and os.environ.get("MATRIS_FUSED_GATED_TAIL_BWD_STATS") == "1"
-            and not _cuda_input_grad_only_gated_tail_bwd_module_allowed(self.module_name)
-        ):
-            _record_gated_tail_bwd_stat("fallback_module", module_name=self.module_name)
-
         if (
             not torch.is_grad_enabled()
             and core.is_cuda
@@ -2567,20 +2439,6 @@ class FusedInputGatedMLP(nn.Module):
         )
 
     @staticmethod
-    def _is_torch_fp8_static(module: nn.Module) -> bool:
-        return (
-            hasattr(module, "fp8_linear")
-            and getattr(module, "last_stats", {}).get("backend") == "torch_scaled_mm_fp8_static"
-        )
-
-    @staticmethod
-    def _is_transformer_engine_fp8(module: nn.Module) -> bool:
-        return (
-            hasattr(module, "te_fp8_linear")
-            and getattr(module, "last_stats", {}).get("backend") == "transformer_engine_fp8"
-        )
-
-    @staticmethod
     def _is_cached_low_precision(module: nn.Module) -> bool:
         return hasattr(module, "weight_low") and getattr(module, "last_stats", {}).get(
             "backend"
@@ -2687,19 +2545,6 @@ class FusedInputGatedMLP(nn.Module):
         self._set_fake_quant_stats(self.core_second, dict(self.core_second.last_stats), core, core_out)
         self._set_fake_quant_stats(self.gate_second, dict(self.gate_second.last_stats), gate, gate_out)
         return core_out, gate_out
-
-    def _torch_fp8_static_fused_second(self, core: Tensor, gate: Tensor) -> tuple[Tensor, Tensor] | None:
-        if not (self._is_torch_fp8_static(self.core_second) and self._is_torch_fp8_static(self.gate_second)):
-            return None
-        return self.core_second.fp8_linear(core), self.gate_second.fp8_linear(gate)
-
-    def _transformer_engine_fp8_fused_second(self, core: Tensor, gate: Tensor) -> tuple[Tensor, Tensor] | None:
-        if not (
-            self._is_transformer_engine_fp8(self.core_second)
-            and self._is_transformer_engine_fp8(self.gate_second)
-        ):
-            return None
-        return self.core_second.te_fp8_linear(core), self.gate_second.te_fp8_linear(gate)
 
     @staticmethod
     def _is_triton_w8a8_static(module: nn.Module) -> bool:
@@ -3145,106 +2990,7 @@ class FusedInputGatedMLP(nn.Module):
         return out
 
     def _w8a_low_precision_fused_second_tail_forward(self, core: Tensor, gate: Tensor) -> Tensor | None:
-        mixed_custom_requested = os.environ.get("MATRIS_USE_MIXED_SECOND_TAIL_CUSTOM_AUTOGRAD") == "1"
-        if os.environ.get("MATRIS_USE_W8A16_SECOND_TAIL_FORWARD_FUSION") != "1" and not mixed_custom_requested:
-            return None
-        if self.core_second is None or self.gate_second is None or self.fused_tail is None:
-            return None
-        if self.core_second_prefix is None or self.gate_second_prefix is None:
-            return None
-        if self.core_post_second_tail is None or self.gate_post_second_tail is None:
-            return None
-        if len(self.core_post_second_tail) != 0 or len(self.gate_post_second_tail) != 0:
-            return None
-        if not (
-            getattr(self.core_second, "backend_preference", None) == "cached_dequant_lowp_v0"
-            and getattr(self.gate_second, "backend_preference", None) == "cached_dequant_lowp_v0"
-            and hasattr(self.core_second, "cached_dequant_weight_lowp")
-            and hasattr(self.gate_second, "cached_dequant_weight_lowp")
-            and getattr(self.core_second, "compute_dtype", None) == getattr(self.gate_second, "compute_dtype", None)
-        ):
-            return None
-        tail = self.fused_tail
-        if not (
-            isinstance(tail.core_norm, nn.LayerNorm)
-            and isinstance(tail.gate_norm, nn.LayerNorm)
-            and tail.core_norm.normalized_shape == tail.gate_norm.normalized_shape == (128,)
-            and tail.core_norm.eps == tail.gate_norm.eps
-            and tail.core_norm.elementwise_affine
-            and tail.gate_norm.elementwise_affine
-            and isinstance(tail.activation_func, FusedSiLU)
-            and isinstance(tail.activation_gate, FusedSigmoid)
-        ):
-            return None
-
-        core_prefix = self.core_second_prefix(core)
-        gate_prefix = self.gate_second_prefix(gate)
-        if not (
-            core_prefix.ndim == 2
-            and gate_prefix.ndim == 2
-            and core_prefix.is_cuda
-            and gate_prefix.is_cuda
-            and core_prefix.shape == gate_prefix.shape
-            and core_prefix.shape[1] == 128
-            and self.core_second.cached_dequant_weight_lowp.shape == (128, 128)
-            and self.gate_second.cached_dequant_weight_lowp.shape == (128, 128)
-        ):
-            return None
-
-        matris_op = _load_matris_op()
-        if matris_op is None or not hasattr(matris_op, "quant_linear_w8a_lowp_dual_cached_tail_forward"):
-            return None
-
-        compute_dtype = self.core_second.compute_dtype
-        empty_bias = self.core_second.cached_dequant_weight_lowp.new_empty(0)
-        core_bias = self.core_second.cached_bias_lowp if self.core_second.cached_bias_lowp is not None else empty_bias
-        gate_bias = self.gate_second.cached_bias_lowp if self.gate_second.cached_bias_lowp is not None else empty_bias
-        if (
-            mixed_custom_requested
-            or os.environ.get("MATRIS_USE_W16A16_SECOND_TAIL_CUSTOM_AUTOGRAD") == "1"
-            or os.environ.get("MATRIS_USE_W16A16_WHOLE_TAIL_DATAFLOW") == "1"
-        ):
-            fused_out = _W8ALowPrecisionSecondTailInputGradFn.apply(
-                core_prefix,
-                gate_prefix,
-                self.core_second.cached_dequant_weight_lowp,
-                self.gate_second.cached_dequant_weight_lowp,
-                core_bias,
-                gate_bias,
-                self.core_second.cached_bias_lowp is not None,
-                self.gate_second.cached_bias_lowp is not None,
-                tail.core_norm.weight.float(),
-                tail.core_norm.bias.float(),
-                tail.gate_norm.weight.float(),
-                tail.gate_norm.bias.float(),
-                float(tail.core_norm.eps),
-            )
-            self._set_fake_quant_stats(self.core_second, dict(self.core_second.last_stats), core, fused_out)
-            self._set_fake_quant_stats(self.gate_second, dict(self.gate_second.last_stats), gate, fused_out)
-            return fused_out
-
-        fused_out = matris_op.quant_linear_w8a_lowp_dual_cached_tail_forward(
-            core_prefix.to(compute_dtype),
-            gate_prefix.to(compute_dtype),
-            self.core_second.cached_dequant_weight_lowp,
-            self.gate_second.cached_dequant_weight_lowp,
-            core_bias,
-            gate_bias,
-            self.core_second.cached_bias_lowp is not None,
-            self.gate_second.cached_bias_lowp is not None,
-            tail.core_norm.weight.float(),
-            tail.core_norm.bias.float(),
-            tail.gate_norm.weight.float(),
-            tail.gate_norm.bias.float(),
-            float(tail.core_norm.eps),
-        )
-
-        # Forward comes from the fused CUDA path; gradients deliberately follow
-        # the existing PyTorch reference graph because this probe is forward-only.
-        core_ref = self.core_second(core_prefix)
-        gate_ref = self.gate_second(gate_prefix)
-        ref_out = tail(core_ref, gate_ref)
-        return fused_out + (ref_out - ref_out.detach())
+        return None
 
     def _fp32_second_tail_input_grad(self, core: Tensor, gate: Tensor) -> Tensor | None:
         legacy_requested = os.environ.get("MATRIS_USE_FP32_SECOND_TAIL_INPUT_GRAD") == "1"
@@ -3443,95 +3189,7 @@ class FusedInputGatedMLP(nn.Module):
         return core_out, gate_out
 
     def _w8a_low_precision_fused_second(self, core: Tensor, gate: Tensor) -> tuple[Tensor, Tensor] | None:
-        if self.core_second is None or self.gate_second is None:
-            return None
-        if not (self._is_w8a_low_precision(self.core_second) and self._is_w8a_low_precision(self.gate_second)):
-            return None
-        if getattr(self.core_second, "compute_dtype", None) != getattr(self.gate_second, "compute_dtype", None):
-            return None
-        if os.environ.get("MATRIS_USE_W8A16_DUAL_SECOND_CUDA") == "1":
-            if (
-                getattr(self.core_second, "backend_preference", None) == "cached_dequant_lowp_v0"
-                and getattr(self.gate_second, "backend_preference", None) == "cached_dequant_lowp_v0"
-                and hasattr(self.core_second, "cached_dequant_weight_lowp")
-                and hasattr(self.gate_second, "cached_dequant_weight_lowp")
-                and core.ndim == 2
-                and gate.ndim == 2
-                and core.is_cuda
-                and gate.is_cuda
-                and core.shape == gate.shape
-                and core.shape[1] == 128
-                and self.core_second.cached_dequant_weight_lowp.shape == (128, 128)
-                and self.gate_second.cached_dequant_weight_lowp.shape == (128, 128)
-            ):
-                compute_dtype = self.core_second.compute_dtype
-                empty_bias = self.core_second.cached_dequant_weight_lowp.new_empty(0)
-                core_bias = (
-                    self.core_second.cached_bias_lowp
-                    if self.core_second.cached_bias_lowp is not None
-                    else empty_bias
-                )
-                gate_bias = (
-                    self.gate_second.cached_bias_lowp
-                    if self.gate_second.cached_bias_lowp is not None
-                    else empty_bias
-                )
-                core_out, gate_out = _W8ALowPrecisionDualCachedSecondFn.apply(
-                    core,
-                    gate,
-                    self.core_second.cached_dequant_weight_lowp,
-                    self.gate_second.cached_dequant_weight_lowp,
-                    core_bias,
-                    gate_bias,
-                    self.core_second.cached_bias_lowp is not None,
-                    self.gate_second.cached_bias_lowp is not None,
-                    compute_dtype,
-                )
-                self._set_fake_quant_stats(self.core_second, dict(self.core_second.last_stats), core, core_out)
-                self._set_fake_quant_stats(self.gate_second, dict(self.gate_second.last_stats), gate, gate_out)
-                return core_out, gate_out
-        if os.environ.get("MATRIS_USE_W8A16_DUAL_SECOND_FUSION") == "1":
-            if (
-                getattr(self.core_second, "backend_preference", None) == "cached_dequant_lowp_v0"
-                and getattr(self.gate_second, "backend_preference", None) == "cached_dequant_lowp_v0"
-                and hasattr(self.core_second, "cached_dequant_weight_lowp")
-                and hasattr(self.gate_second, "cached_dequant_weight_lowp")
-            ):
-                x = torch.cat([core, gate], dim=-1)
-                cache_key = "_w8a_lowp_cached_dequant_second_cache"
-                cache = getattr(self, cache_key, None)
-                if cache is None or cache["device"] != x.device:
-                    core_out, core_in = self.core_second.cached_dequant_weight_lowp.shape
-                    gate_out, gate_in = self.gate_second.cached_dequant_weight_lowp.shape
-                    weight = self.core_second.cached_dequant_weight_lowp.new_zeros(
-                        (core_out + gate_out, core_in + gate_in)
-                    )
-                    weight[:core_out, :core_in] = self.core_second.cached_dequant_weight_lowp
-                    weight[core_out:, core_in:] = self.gate_second.cached_dequant_weight_lowp
-                    bias = torch.cat(
-                        [
-                            self.core_second.cached_bias_lowp
-                            if self.core_second.cached_bias_lowp is not None
-                            else weight.new_zeros(core_out),
-                            self.gate_second.cached_bias_lowp
-                            if self.gate_second.cached_bias_lowp is not None
-                            else weight.new_zeros(gate_out),
-                        ],
-                        dim=0,
-                    ).contiguous()
-                    cache = {
-                        "device": x.device,
-                        "weight": weight.contiguous(),
-                        "bias": bias,
-                        "dtype": weight.dtype,
-                    }
-                    setattr(self, cache_key, cache)
-                projected = F.linear(x.to(cache["dtype"]), cache["weight"], cache["bias"]).float()
-                core_out, gate_out = projected.split([self.core_output_dim, self.gate_output_dim], dim=-1)
-                self._set_fake_quant_stats(self.core_second, dict(self.core_second.last_stats), core, core_out)
-                self._set_fake_quant_stats(self.gate_second, dict(self.gate_second.last_stats), gate, gate_out)
-                return core_out, gate_out
-        return self.core_second(core), self.gate_second(gate)
+        return None
 
     def _fused_first_projection(self, feas: Tensor) -> tuple[Tensor, Tensor]:
         if self.fused_first is not None:
@@ -3623,15 +3281,9 @@ class FusedInputGatedMLP(nn.Module):
             core = self.core_tail(core)
             gate = self.gate_tail(gate)
         else:
-            fp32_second_tail = self._fp32_second_tail_input_grad(core, gate)
-            if fp32_second_tail is not None:
-                return fp32_second_tail
             fused_second_tail = self._cuda_cutlass_w8a8_static_fused_second_tail(core, gate)
             if fused_second_tail is not None:
                 return fused_second_tail
-            w8a_lowp_second_tail = self._w8a_low_precision_fused_second_tail_forward(core, gate)
-            if w8a_lowp_second_tail is not None:
-                return w8a_lowp_second_tail
             fused_silu_second = self._triton_w8a8_static_fused_silu_second(core, gate)
             if fused_silu_second is None:
                 core = self.core_second_prefix(core)
@@ -3679,10 +3331,6 @@ class FusedInputGatedMLP(nn.Module):
             projected = self.fused_second(torch.cat([core, gate], dim=-1))
             return projected.split([self.core_output_dim, self.gate_output_dim], dim=-1)
 
-        w8a_low_precision_projected = self._w8a_low_precision_fused_second(core, gate)
-        if w8a_low_precision_projected is not None:
-            return w8a_low_precision_projected
-
         low_precision_projected = self._cached_low_precision_fused_second(core, gate)
         if low_precision_projected is not None:
             return low_precision_projected
@@ -3694,14 +3342,6 @@ class FusedInputGatedMLP(nn.Module):
         triton_projected = self._triton_w8a32_fused_second(core, gate)
         if triton_projected is not None:
             return triton_projected
-
-        fp8_projected = self._torch_fp8_static_fused_second(core, gate)
-        if fp8_projected is not None:
-            return fp8_projected
-
-        te_fp8_projected = self._transformer_engine_fp8_fused_second(core, gate)
-        if te_fp8_projected is not None:
-            return te_fp8_projected
 
         core_weight, core_bias, core_stats = self._weight_bias_stats(self.core_second)
         gate_weight, gate_bias, gate_stats = self._weight_bias_stats(self.gate_second)
