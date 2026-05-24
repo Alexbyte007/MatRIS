@@ -1,0 +1,36 @@
+matris.egg-info/
+build/
+# build/cache
+*.egg-info/
+.eggs/
+__pycache__/
+*.py[cod]
+*.so
+
+# local outputs
+results/
+logs/
+quant/
+
+# model weights / datasets
+*.pth
+*.pth.tar
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.lmdb
+*.db
+*.sqlite
+*.jsonl
+*.npy
+*.npz
+
+# local/temp
+.DS_Store
+=2.11
+
+# local backups / vendored deps
+*.backup_before_*.txt
+*.full_backup_*.txt
+external/
