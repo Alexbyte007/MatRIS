@@ -1,6 +1,6 @@
 MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
-更新时间：2026-05-31
+更新时间：2026-06-01
 
 本清单只维护 MatRIS sAlex teacher `efsm` 路径的有效优化主线。旧量化路线、失败分支和重复过程日志已精简；详细原始记录可查 `MatRIS_compile任务清单.txt` 和 `results/`。
 
@@ -15,15 +15,16 @@ MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
 当前最佳候选
 
-当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro。
+当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro + line graph GC guard。
 
 核心结论：
 
-- limit500：`73.482076 ms`
-- limit5000：`73.422104 ms`
-- 相对历史正式 FP32 baseline 5000：约 `1.785x`
-- 相对 P108 attn_line dense-GEMM 旧最佳：约 `1.144x`
-- 相对 P113 second-tail 初版：约 `1.104x`
+- limit500：`70.504408 ms`
+- limit5000：`70.541407 ms`
+- 相对历史正式 FP32 baseline 5000：约 `1.858x`
+- 相对 P108 attn_line dense-GEMM 旧最佳：约 `1.191x`
+- 相对 P113 second-tail 初版：约 `1.149x`
+- 相对旧 P115 5000：约 `1.041x`
 
 当前最佳优化栈：
 
@@ -35,6 +36,7 @@ MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 + attn_line dense-GEMM/cuBLAS backward 大图路径
 + GatedMLP second-tail CUDA macro
 + second-tail macro 扩到 atom edge 和 atom/line node update
++ 构图 line_graph 阶段临时禁用 Python GC，降低 CPU 长尾
 ```
 
 P115 的关键优化点
@@ -61,12 +63,19 @@ LayerNorm backward
   - `attn_line.node_nonlinear_update`
   - 原 P113 覆盖的 line/refine GatedMLP second-tail 路径
 
-P115 端到端结果
+P115 + line graph GC guard 端到端结果
 
 | 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | energy_mae_natoms | force_mae | stress_mae | 成功样本 | 结论 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| P115 | 500 | `73.482076` | `36.741038` | `13.608761` | `0.007654576930` | `0.021735995319` | `0.001431522633` | `500/500` | 当前 500 最佳 |
-| P115 | 5000 | `73.422104` | `367.037097` | `13.619877` | `0.009076239566` | `0.025285662142` | `0.001527281265` | `4999/5000` | 当前 5000 最佳 |
+| P115 + line_graph GC guard | 500 | `70.504408` | `35.252204` | `14.183510` | `0.007654580501` | `0.021735981310` | `0.001431523006` | `500/500` | 当前 500 最佳 |
+| P115 + line_graph GC guard | 5000 | `70.541407` | `352.636495` | `14.176071` | `0.009076240317` | `0.025285672117` | `0.001527279890` | `4999/5000` | 当前 5000 最佳 |
+
+旧 P115 结果：
+
+| 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | 成功样本 | 说明 |
+| --- | ---: | ---: | ---: | ---: | --- | --- |
+| P115 | 500 | `73.482076` | `36.741038` | `13.608761` | `500/500` | GC guard 前历史最佳 |
+| P115 | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | GC guard 前历史最佳 |
 
 P115 limit5000 跳过样本：
 
@@ -74,7 +83,7 @@ P115 limit5000 跳过样本：
 - `graph_id=219803`
 - 原因：`Detected 2 isolated atom. Calculation stopped`
 
-P115 当前保留/清理状态（2026-05-31）
+P115 当前保留/清理状态（2026-06-01）
 
 结论：当前应该保留 P115 主线，不继续粗暴删除旧 refine gate。
 
@@ -84,6 +93,8 @@ P115 当前保留/清理状态（2026-05-31）
 - 旧 refine gate 代码先保留为历史兼容路径，不继续作为优化方向，也不直接物理删除；此前粗暴绕过旧 refine gate 会变慢，说明这部分不能用“全删掉”处理。
 - standalone benchmark/profile/check 脚本可以作为历史记录保留，但它们不代表当前 endpoint 候选；只有 `infer_salex_lmdb_quant.py --measure-time` 的端到端结果用于更新最佳。
 - 之后如果要瘦身代码，必须按“删除一组旧 gate -> correctness -> limit500 endpoint”的顺序做，不能一次性大范围删 refine 分支。
+- 当前默认保留 `MATRIS_DISABLE_GC_DURING_LINE_GRAPH=1`，它只在 `line_graph_adjacency_list + tensor conversion` 周围临时禁用/恢复 Python GC，不改变图结构输出。
+- `MATRIS_USE_FAST_LINE_GRAPH=1` 是 Cython line_graph 实验路径：30 个真实样本 exact match，局部 line_graph mean 从 `0.749 ms` 到 `0.585 ms`，但端到端 limit500 与 GC guard 基本持平；因此默认关闭，仅作为后续更底层 C++/tensor line graph 的基线。
 
 保留内容：
 
@@ -130,7 +141,8 @@ P115 当前保留/清理状态（2026-05-31）
 | P106 A-CUDA2 | 5000 | `84.457298` | `422.202033` | `11.840303` | `4999/5000` | P115 快 `1.150x` |
 | P108 A-CUDA3 | 5000 | `83.991692` | `419.874467` | `11.905940` | `4999/5000` | P115 快 `1.144x` |
 | P113 GatedMLP second-tail | 5000 | `81.062566` | `405.231769` | `12.336150` | `4999/5000` | P115 快 `1.104x` |
-| P115 all node + atom edge second-tail | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | 当前最佳 |
+| P115 all node + atom edge second-tail | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | 旧最佳 |
+| P115 + line_graph GC guard | 5000 | `70.541407` | `352.636495` | `14.176071` | `4999/5000` | 当前最佳 |
 
 当前最佳复跑命令
 
@@ -141,6 +153,8 @@ CUDA_VISIBLE_DEVICES=0 \
 CUDA_HOME=/home/lht/miniconda3/envs/matris311 \
 PATH=/home/lht/miniconda3/envs/matris311/bin:$PATH \
 LD_LIBRARY_PATH=/home/lht/miniconda3/envs/matris311/lib:$LD_LIBRARY_PATH \
+MATRIS_DISABLE_GC_DURING_LINE_GRAPH=1 \
+MATRIS_USE_FAST_LINE_GRAPH=0 \
 MATRIS_P26_TAIL_INPUT_GRAD_ONLY=1 \
 MATRIS_P28_MLP_INPUT_GRAD_ONLY=1 \
 MATRIS_P29_MLP_BWD_KERNEL=1 \

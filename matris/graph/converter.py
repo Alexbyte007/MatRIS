@@ -14,9 +14,10 @@ from .radiusgraph import Graph, Node, RadiusGraph
 from pymatgen.core import Structure
 
 try:
-    from .cygraph import make_graph
+    from .cygraph import line_graph_adjacency_list_fast, make_graph
 except (ImportError, AttributeError):
     make_graph = None
+    line_graph_adjacency_list_fast = None
 
 datatype = torch.float32
 
@@ -116,14 +117,35 @@ class GraphConverter(nn.Module):
         undirected2directed = torch.tensor(undirected2directed, dtype=torch.int32)
         
         line_graph = []
+        disable_gc_for_line_graph = os.environ.get(
+            "MATRIS_DISABLE_GC_DURING_LINE_GRAPH", "1"
+        ) != "0"
+        use_fast_line_graph = (
+            line_graph_adjacency_list_fast is not None
+            and os.environ.get("MATRIS_USE_FAST_LINE_GRAPH", "0") == "1"
+        )
+        gc_was_enabled = gc.isenabled()
+        if disable_gc_for_line_graph and gc_was_enabled:
+            gc.disable()
         try:
-            line_graph = graph.line_graph_adjacency_list(
-                cutoff=self.line_graph_cutoff
-            ) 
-        except Exception as exc:
-            structure.to(filename="error_graph.cif")
+            try:
+                if use_fast_line_graph:
+                    line_graph = line_graph_adjacency_list_fast(
+                        graph.nodes,
+                        graph.undirected_edges_list,
+                        self.line_graph_cutoff,
+                    )
+                else:
+                    line_graph = graph.line_graph_adjacency_list(
+                        cutoff=self.line_graph_cutoff
+                    )
+            except Exception as exc:
+                structure.to(filename="error_graph.cif")
 
-        line_graph = torch.tensor(line_graph, dtype=torch.int32)
+            line_graph = torch.tensor(line_graph, dtype=torch.int32)
+        finally:
+            if disable_gc_for_line_graph and gc_was_enabled:
+                gc.enable()
 
         # For isolated atom, we stop this calculation
         n_isolated_atoms = len({*range(n_atoms)} - {*center_index})
