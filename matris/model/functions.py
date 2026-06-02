@@ -357,6 +357,10 @@ def _use_p83b_fused_line_attention_target_offsets() -> bool:
     return os.environ.get("MATRIS_P83B_LINE_ATTENTION_TARGET_OFFSETS", "0") == "1"
 
 
+def _use_p120_atom_attention_target_offsets() -> bool:
+    return os.environ.get("MATRIS_P120_ATOM_ATTENTION_TARGET_OFFSETS", "0") == "1"
+
+
 def _use_p83c_fused_line_attention_node_input() -> bool:
     return os.environ.get("MATRIS_P83C_LINE_ATTENTION_NODE_INPUT", "0") == "1"
 
@@ -3190,8 +3194,10 @@ class _CudaFusedLineAttention(torch.autograd.Function):
             target_logits_c = target_logits.contiguous()
             values_c = values.contiguous()
             if (
-                not bool(atom_graph)
-                and _use_p83b_fused_line_attention_target_offsets()
+                (
+                    (not bool(atom_graph) and _use_p83b_fused_line_attention_target_offsets())
+                    or (bool(atom_graph) and _use_p120_atom_attention_target_offsets())
+                )
                 and isinstance(target_offsets, Tensor)
                 and target_offsets.is_cuda
                 and target_offsets.dtype == torch.int64

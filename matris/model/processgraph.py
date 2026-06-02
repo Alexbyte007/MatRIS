@@ -23,6 +23,10 @@ def _use_p83_line_attention_offsets() -> bool:
     )
 
 
+def _use_p120_atom_attention_target_offsets() -> bool:
+    return os.environ.get("MATRIS_P120_ATOM_ATTENTION_TARGET_OFFSETS", "0") == "1"
+
+
 def _segment_offsets_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
     offsets = torch.empty(
         int(lengths.shape[0]) + 1,
@@ -277,6 +281,8 @@ def process_graphs(graphs: Sequence[RadiusGraph],
     bincount_target_atom_graph = bincount_target_atom_graph.where(bincount_target_atom_graph != 0, bincount_target_atom_graph.new_ones(1))
     atom_graph_dict['source_bincount'] = bincount_source_atom_graph
     atom_graph_dict['target_bincount'] = bincount_target_atom_graph
+    if _use_p120_atom_attention_target_offsets():
+        atom_graph_dict['target_segment_offsets'] = _segment_offsets_from_lengths(bincount_target_atom_graph)
     
     line_graph_dict['line_graph'] = batch_line_graph_compress
     if len(line_graph_dict['line_graph']) != 0:

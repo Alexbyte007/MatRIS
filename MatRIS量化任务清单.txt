@@ -1,6 +1,6 @@
 MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
-更新时间：2026-06-01
+更新时间：2026-06-02
 
 本清单只维护 MatRIS sAlex teacher `efsm` 路径的有效优化主线。旧量化路线、失败分支和重复过程日志已精简；详细原始记录可查 `MatRIS_compile任务清单.txt` 和 `results/`。
 
@@ -15,16 +15,17 @@ MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 
 当前最佳候选
 
-当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro + line graph GC guard。
+当前最佳：P115 all node + atom edge GatedMLP second-tail CUDA macro + line graph GC guard + atom attention P35/P120。
 
 核心结论：
 
-- limit500：`70.504408 ms`
-- limit5000：`70.541407 ms`
-- 相对历史正式 FP32 baseline 5000：约 `1.858x`
-- 相对 P108 attn_line dense-GEMM 旧最佳：约 `1.191x`
-- 相对 P113 second-tail 初版：约 `1.149x`
-- 相对旧 P115 5000：约 `1.041x`
+- limit500：`69.101997 ms`
+- limit5000：`69.341815 ms`
+- limit5000 当前最佳总时间：`346.639731 s`
+- 相对最初 FP32 baseline 5000 总时间：`1.894104x`
+- 相对 P108 attn_line dense-GEMM 旧最佳：约 `1.211x`
+- 相对 P113 second-tail 初版：约 `1.169x`
+- 相对 P115 + line graph GC guard 5000：约 `1.018x`
 
 当前最佳优化栈：
 
@@ -37,6 +38,8 @@ MatRIS sAlex FP32 Fuse / CUDA Macro / Compile 辅助优化清单
 + GatedMLP second-tail CUDA macro
 + second-tail macro 扩到 atom edge 和 atom/line node update
 + 构图 line_graph 阶段临时禁用 Python GC，降低 CPU 长尾
++ atom edge gather/index_select+cat + first projection dataflow
++ atom attention target-offset forward，减少 target reduce/zero/max glue
 ```
 
 P115 的关键优化点
@@ -63,19 +66,21 @@ LayerNorm backward
   - `attn_line.node_nonlinear_update`
   - 原 P113 覆盖的 line/refine GatedMLP second-tail 路径
 
-P115 + line graph GC guard 端到端结果
+P115 + line graph GC guard + atom attention P35/P120 端到端结果
 
 | 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | energy_mae_natoms | force_mae | stress_mae | 成功样本 | 结论 |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |
-| P115 + line_graph GC guard | 500 | `70.504408` | `35.252204` | `14.183510` | `0.007654580501` | `0.021735981310` | `0.001431523006` | `500/500` | 当前 500 最佳 |
-| P115 + line_graph GC guard | 5000 | `70.541407` | `352.636495` | `14.176071` | `0.009076240317` | `0.025285672117` | `0.001527279890` | `4999/5000` | 当前 5000 最佳 |
+| P115 + GC guard + P35/P120 atom attention | 500 | `69.101997` | `34.550998` | `14.471362` | `0.007654570565` | `0.021735963863` | `0.001431521616` | `500/500` | 当前 500 最佳 |
+| P115 + GC guard + P35/P120 atom attention | 5000 | `69.341815` | `346.639731` | `14.421313` | `0.009076239999` | `0.025285691717` | `0.001527280735` | `4999/5000` | 当前 5000 最佳；总时间相对最初 FP32 baseline `1.894104x` |
 
-旧 P115 结果：
+旧 P115/GC guard 结果：
 
 | 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | 成功样本 | 说明 |
 | --- | ---: | ---: | ---: | ---: | --- | --- |
 | P115 | 500 | `73.482076` | `36.741038` | `13.608761` | `500/500` | GC guard 前历史最佳 |
 | P115 | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | GC guard 前历史最佳 |
+| P115 + line_graph GC guard | 500 | `70.504408` | `35.252204` | `14.183510` | `500/500` | P35/P120 前最佳 |
+| P115 + line_graph GC guard | 5000 | `70.577460` | `352.816722` | `14.168830` | `4999/5000` | P35/P120 前最佳 |
 
 P115 limit5000 跳过样本：
 
@@ -83,9 +88,9 @@ P115 limit5000 跳过样本：
 - `graph_id=219803`
 - 原因：`Detected 2 isolated atom. Calculation stopped`
 
-P115 当前保留/清理状态（2026-06-01）
+P115 当前保留/清理状态（2026-06-02）
 
-结论：当前应该保留 P115 主线，不继续粗暴删除旧 refine gate。
+结论：当前应该保留 P115 主线，并加入 P35/P120 atom attention 小扩边界；不继续粗暴删除旧 refine gate。
 
 当前执行口径：
 
@@ -105,6 +110,7 @@ P115 当前保留/清理状态（2026-06-01）
   - directed2undirected CUDA fused op
   - `P101/P105/P106/P108`
   - `P113/P114/P115`
+  - `P35/P120 atom attention`
 - 保留旧 refine gate 的原路径逻辑，但不把它们作为优化主线。
 
 已清理/取消接入：
@@ -136,13 +142,14 @@ P115 当前保留/清理状态（2026-06-01）
 | 候选 | limit | latency_ms_mean | latency_s_total | throughput_structures_per_s | 成功样本 | 相对 P115 |
 | --- | ---: | ---: | ---: | ---: | --- | ---: |
 | FP32 baseline | 500 | `133.608348` | `66.804174` | - | `500/500` | P115 快 `1.818x` |
-| FP32 baseline | 5000 | `131.042806` | - | `7.631094` | `4999/5000` | P115 快 `1.785x` |
+| FP32 baseline | 5000 | `131.340575` | `656.571536` | `7.613793` | `4999/5000` | 当前最佳按总时间快 `1.894104x` |
 | stable pure fuse anchor | 500 | `85.187982` | `42.593991` | `11.738745` | `500/500` | P115 快 `1.159x` |
 | P106 A-CUDA2 | 5000 | `84.457298` | `422.202033` | `11.840303` | `4999/5000` | P115 快 `1.150x` |
 | P108 A-CUDA3 | 5000 | `83.991692` | `419.874467` | `11.905940` | `4999/5000` | P115 快 `1.144x` |
 | P113 GatedMLP second-tail | 5000 | `81.062566` | `405.231769` | `12.336150` | `4999/5000` | P115 快 `1.104x` |
 | P115 all node + atom edge second-tail | 5000 | `73.422104` | `367.037097` | `13.619877` | `4999/5000` | 旧最佳 |
-| P115 + line_graph GC guard | 5000 | `70.541407` | `352.636495` | `14.176071` | `4999/5000` | 当前最佳 |
+| P115 + line_graph GC guard | 5000 | `70.577460` | `352.816722` | `14.168830` | `4999/5000` | P35/P120 前最佳 |
+| P115 + GC guard + P35/P120 atom attention | 5000 | `69.341815` | `346.639731` | `14.421313` | `4999/5000` | 当前最佳，总时间加速 `1.894104x` |
 
 当前最佳复跑命令
 
@@ -170,6 +177,8 @@ MATRIS_P108_A_CUDA3_ATTN_LINE_DENSE_GEMM_SCATTER_THRESHOLD=4096 \
 MATRIS_P113_GATED_TAIL_SECOND_SILU_MACRO=1 \
 MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1 \
 MATRIS_P115_ALL_NODE_SECOND_TAIL=1 \
+MATRIS_P35_ATOM_EDGE_FIRST_DATAFLOW=1 \
+MATRIS_P120_ATOM_ATTENTION_TARGET_OFFSETS=1 \
 /home/lht/miniconda3/envs/matris311/bin/python \
 test/eval/infer_salex_lmdb_quant.py \
   --dataset-src /home/lht/lab/sAlex/val \
@@ -184,16 +193,16 @@ test/eval/infer_salex_lmdb_quant.py \
   --activation-calibration-limit 64 \
   --activation-calibration-seed 43 \
   --measure-time \
-  --output-json results/recheck_p115_all_node_atom_edge_second_tail_limit500/eval/summary.json \
-  --save-predictions results/recheck_p115_all_node_atom_edge_second_tail_limit500/eval/predictions.jsonl
+  --output-json results/p115_gc_p35_p120_atom_target_offsets_limit500/eval/summary.json \
+  --save-predictions results/p115_gc_p35_p120_atom_target_offsets_limit500/eval/predictions.jsonl
 ```
 
 limit5000 时只替换：
 
 ```bash
   --limit 5000 \
-  --output-json results/recheck_p115_all_node_atom_edge_second_tail_limit5000/eval/summary.json \
-  --save-predictions results/recheck_p115_all_node_atom_edge_second_tail_limit5000/eval/predictions.jsonl
+  --output-json results/p115_gc_p35_p120_atom_target_offsets_limit5000/eval/summary.json \
+  --save-predictions results/p115_gc_p35_p120_atom_target_offsets_limit5000/eval/predictions.jsonl
 ```
 
 CUDA extension 编译
@@ -243,7 +252,19 @@ LD_LIBRARY_PATH=/home/lht/miniconda3/envs/matris311/lib:$LD_LIBRARY_PATH \
 - `MATRIS_P114_ATOM_EDGE_SECOND_TAIL=1`
 - `MATRIS_P115_ALL_NODE_SECOND_TAIL=1`
 - 目标：把 compile 发现的 `tail backward + second Linear input-grad + SiLU grad` 边界落成 CUDA macro，并扩到更多同形态 GatedMLP。
-- 结果：limit5000 `73.422104 ms`，当前最佳。
+- 结果：limit5000 `73.422104 ms`，P35/P120 前的 GatedMLP macro 主线。
+
+5. P35/P120 atom attention 小扩边界
+
+- `MATRIS_P35_ATOM_EDGE_FIRST_DATAFLOW=1`
+- `MATRIS_P120_ATOM_ATTENTION_TARGET_OFFSETS=1`
+- P35 目标：把 atom edge 的 `index_select + cat + first projection` 组织进已有 directed-edge CUDA dataflow，减少 atom gather_concat 和 first projection 周围的 glue。
+- P120 目标：利用 atom `target_index` 在真实样本中按 target 连续的性质，复用 target segment offsets 版本 attention forward，减少 target-side max/sum/zero/reduce 相关开销。
+- profile 结论：directed2undirected 已经很小，atom attention 更值得做的是 forward target reduce/zero/max、gather_concat、edge_update/node_update 周围 glue。
+- 结果：
+  - P35 only limit500：`69.680353 ms`
+  - P35+P120 limit500：`69.101997 ms`
+  - P35+P120 limit5000：`69.341815 ms`，当前最佳。
 
 当前 compile 结论
 
@@ -257,7 +278,7 @@ GatedMLP tail backward
 + pre-second SiLU derivative
 ```
 
-这个边界已经落成 P113/P114/P115 CUDA macro，并成为当前最佳。
+这个边界已经落成 P113/P114/P115 CUDA macro，并成为当前最佳候选的核心主线；P35/P120 是在其基础上继续补的 atom attention 小扩边界。
 
 不建议继续的 compile endpoint 路线：
 
@@ -331,14 +352,14 @@ GatedMLP tail backward
 
 下一步建议
 
-优先级 1：profile 当前 P115 最佳路径
+优先级 1：profile 当前 P115 + P35/P120 最佳路径
 
 目标：
 
-- 确认 P115 后新的 top hotspot。
+- 确认 P35/P120 后新的 top hotspot。
 - 重点看：
   - P113/P115 second-tail 内部 GEMM + SiLU epilogue 是否仍明显。
-  - attn_atom 是否接近或超过 attn_line。
+  - attn_atom 的剩余热点是否从 attention forward 转到 node_update/edge_update GEMM glue。
   - refine_line/refine_atom 是否重新成为主要热点。
   - scatter/gather/copy_layout 是否有新的集中长尾。
 
@@ -358,6 +379,9 @@ GatedMLP tail backward
 
 - P115 limit500：`results/p115_all_node_second_tail_limit500_20260526/eval/summary.json`
 - P115 limit5000：`results/recheck_p115_all_node_atom_edge_second_tail_limit5000/eval/summary.json`
+- P115 + GC guard limit5000：`results/final_p115_gc_guard_fp32_limit5000_20260601/eval/summary.json`
+- P115 + GC guard + P35/P120 limit500：`results/p115_gc_p35_p120_atom_target_offsets_limit500_20260602/eval/summary.json`
+- P115 + GC guard + P35/P120 limit5000：`results/p115_gc_p35_p120_atom_target_offsets_limit5000_20260602/eval/summary.json`
 - P113 limit5000：`results/p113_gated_tail_second_silu_macro_limit5000_20260526/eval/summary.json`
 - P108 limit5000：`results/attn_line_macro_p108_a_cuda3_dense_gemm_op_cublas_hybrid4096_limit5000_20260525/eval/summary.json`
 - P106 limit5000：`results/recheck_p106_a_cuda2_limit5000_current/eval/summary.json`

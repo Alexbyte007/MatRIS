@@ -41,15 +41,27 @@ THRESHOLD_VALUE = 60000 # Safe value for MatRIS-10M (A100-80GB)
 
 def _attn_line_detail_profile_enabled(profile_prefix: str) -> bool:
     return (
-        os.environ.get("MATRIS_ATTNLINE_DETAIL_PROFILE", "0") == "1"
-        and profile_prefix.endswith(".attn_line")
+        (
+            os.environ.get("MATRIS_ATTNLINE_DETAIL_PROFILE", "0") == "1"
+            and profile_prefix.endswith(".attn_line")
+        )
+        or (
+            os.environ.get("MATRIS_ATTNATOM_DETAIL_PROFILE", "0") == "1"
+            and profile_prefix.endswith(".attn_atom")
+        )
     )
 
 
 def _attn_line_record_function_enabled(profile_prefix: str) -> bool:
     return (
-        os.environ.get("MATRIS_ATTNLINE_RECORD_FUNCTION", "0") == "1"
-        and profile_prefix.endswith(".attn_line")
+        (
+            os.environ.get("MATRIS_ATTNLINE_RECORD_FUNCTION", "0") == "1"
+            and profile_prefix.endswith(".attn_line")
+        )
+        or (
+            os.environ.get("MATRIS_ATTNATOM_RECORD_FUNCTION", "0") == "1"
+            and profile_prefix.endswith(".attn_atom")
+        )
     )
 
 
