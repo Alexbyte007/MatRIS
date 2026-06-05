@@ -29,20 +29,32 @@ def _calculator_stage_profile_enabled() -> bool:
     return os.environ.get("MATRIS_CALCULATOR_STAGE_PROFILE", "0") == "1"
 
 
+def _nvtx_ranges_enabled() -> bool:
+    return os.environ.get("MATRIS_NVTX_RANGES", "0") == "1" and torch.cuda.is_available()
+
+
 def _sync_if_needed(device: str) -> None:
     if device == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
 def _timed_stage(device: str, profile: dict[str, float], name: str, fn):
-    if not _calculator_stage_profile_enabled():
-        return fn()
-    _sync_if_needed(device)
-    start = time.perf_counter()
-    result = fn()
-    _sync_if_needed(device)
-    profile[name] = (time.perf_counter() - start) * 1000.0
-    return result
+    profile_enabled = _calculator_stage_profile_enabled()
+    nvtx_enabled = _nvtx_ranges_enabled()
+    if nvtx_enabled:
+        torch.cuda.nvtx.range_push(f"calculator.{name}")
+    try:
+        if not profile_enabled:
+            return fn()
+        _sync_if_needed(device)
+        start = time.perf_counter()
+        result = fn()
+        _sync_if_needed(device)
+        profile[name] = (time.perf_counter() - start) * 1000.0
+        return result
+    finally:
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
 
 def _to_numpy(value):

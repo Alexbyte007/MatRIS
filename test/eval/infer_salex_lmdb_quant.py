@@ -91,6 +91,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--activation-calibration-limit", type=int, default=0)
     parser.add_argument("--activation-calibration-seed", type=int, default=43)
+    parser.add_argument(
+        "--large-supercell-repeat",
+        default="1,1,1",
+        help=(
+            "Large-graph experiment only: repeat each ASE Atoms object before "
+            "inference, e.g. '2,2,2'. Labels are scaled/tiled for reporting."
+        ),
+    )
+    parser.add_argument(
+        "--large-supercell-max-atoms",
+        type=int,
+        default=0,
+        help=(
+            "Large-graph safety cap. When >0, skip samples whose repeated "
+            "structure would exceed this atom count."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -136,6 +153,50 @@ def select_group_aligned_keys(dataset_len: int, limit: int, seed: int) -> np.nda
     if limit > 0:
         keys = keys[:limit]
     return keys
+
+
+def parse_supercell_repeat(repeat_text: str) -> tuple[int, int, int]:
+    text = repeat_text.strip().lower().replace("x", ",")
+    parts = [part.strip() for part in text.split(",") if part.strip()]
+    if len(parts) == 1:
+        repeat = (int(parts[0]),) * 3
+    elif len(parts) == 3:
+        repeat = tuple(int(part) for part in parts)
+    else:
+        raise ValueError(
+            "--large-supercell-repeat must be an int or three ints, e.g. '2' or '2,2,1'."
+        )
+    if any(value <= 0 for value in repeat):
+        raise ValueError("--large-supercell-repeat values must be positive.")
+    return repeat
+
+
+def load_atoms_with_labels(
+    structures: AseDBDataset,
+    graph_id: int,
+    repeat: tuple[int, int, int],
+    max_atoms: int,
+):
+    atom = structures.get_atoms(graph_id)
+    original_natoms = len(atom)
+    energy_label = float(atom.get_potential_energy())
+    label_force = np.asarray(atom.get_forces())
+    label_stress = np.asarray(atom.get_stress())
+
+    repeat_factor = int(np.prod(repeat))
+    repeated_natoms = original_natoms * repeat_factor
+    if max_atoms > 0 and repeated_natoms > max_atoms:
+        raise RuntimeError(
+            f"repeated structure has {repeated_natoms} atoms "
+            f"(original {original_natoms}, repeat {repeat}), over cap {max_atoms}"
+        )
+
+    if repeat_factor > 1:
+        atom = atom.repeat(repeat)
+        energy_label *= repeat_factor
+        label_force = np.tile(label_force, (repeat_factor, 1))
+
+    return atom, energy_label, label_force, label_stress, original_natoms, repeat_factor
 
 
 def resolve_model_path(model_path: str) -> Path:
@@ -224,8 +285,14 @@ def run_activation_calibration(
         module.reset_activation_calibration()
         module.calibrating_activation = True
 
+    repeat = parse_supercell_repeat(args.large_supercell_repeat)
     for graph_id in tqdm(keys, desc="activation calibration", leave=False):
-        atom = structures.get_atoms(int(graph_id))
+        atom, _, _, _, _, _ = load_atoms_with_labels(
+            structures,
+            int(graph_id),
+            repeat,
+            args.large_supercell_max_atoms,
+        )
         atom.calc = calculator
         with autocast_context(args.device, args.precision_mode):
             _ = atom.get_potential_energy()
@@ -327,6 +394,8 @@ def summarize_timing(latencies_ms: list[float], n_atoms: list[int]) -> dict:
 
 def main() -> None:
     args = parse_args()
+    supercell_repeat = parse_supercell_repeat(args.large_supercell_repeat)
+    supercell_repeat_factor = int(np.prod(supercell_repeat))
     precision_info = configure_precision(args.device, args.precision_mode)
     structures = AseDBDataset(config={"src": args.dataset_src})
     keys = select_group_aligned_keys(len(structures), args.limit, args.sample_seed)
@@ -443,10 +512,19 @@ def main() -> None:
         if args.prefetch_graphs and args.batch_size <= 1:
             def prepare_one(idx: int) -> dict:
                 graph_id = int(keys[idx])
-                atom = structures.get_atoms(graph_id)
-                energy_label = atom.get_potential_energy()
-                label_force = atom.get_forces()
-                label_stress = atom.get_stress()
+                (
+                    atom,
+                    energy_label,
+                    label_force,
+                    label_stress,
+                    original_natoms,
+                    repeat_factor,
+                ) = load_atoms_with_labels(
+                    structures,
+                    graph_id,
+                    supercell_repeat,
+                    args.large_supercell_max_atoms,
+                )
                 calculator._adjust_pbc(atom)
                 structure = AseAtomsAdaptor.get_structure(atom)
                 graph_cpu = calculator.model.graph_converter(structure)
@@ -458,6 +536,8 @@ def main() -> None:
                     "energy_label": energy_label,
                     "label_force": label_force,
                     "label_stress": label_stress,
+                    "original_natoms": original_natoms,
+                    "repeat_factor": repeat_factor,
                     "graph_cpu": graph_cpu,
                     "n_atoms_factor": n_atoms_factor,
                 }
@@ -509,10 +589,19 @@ def main() -> None:
                 try:
                     graph_id = int(keys[idx])
 
-                    atom = structures.get_atoms(graph_id)
-                    energy_label = atom.get_potential_energy()
-                    label_force = atom.get_forces()
-                    label_stress = atom.get_stress()
+                    (
+                        atom,
+                        energy_label,
+                        label_force,
+                        label_stress,
+                        _,
+                        _,
+                    ) = load_atoms_with_labels(
+                        structures,
+                        graph_id,
+                        supercell_repeat,
+                        args.large_supercell_max_atoms,
+                    )
 
                     atom.calc = calculator
 
@@ -549,7 +638,19 @@ def main() -> None:
             for idx in tqdm(range(len(keys))):
                 try:
                     graph_id = int(keys[idx])
-                    atom = structures.get_atoms(graph_id)
+                    (
+                        atom,
+                        energy_label,
+                        label_force,
+                        label_stress,
+                        _,
+                        _,
+                    ) = load_atoms_with_labels(
+                        structures,
+                        graph_id,
+                        supercell_repeat,
+                        args.large_supercell_max_atoms,
+                    )
                     atom_n = len(atom)
 
                     if (
@@ -567,9 +668,9 @@ def main() -> None:
                         {
                             "idx": idx,
                             "graph_id": graph_id,
-                            "energy_label": atom.get_potential_energy(),
-                            "label_force": atom.get_forces(),
-                            "label_stress": atom.get_stress(),
+                            "energy_label": energy_label,
+                            "label_force": label_force,
+                            "label_stress": label_stress,
                         }
                     )
                     pending_natoms += atom_n
@@ -617,6 +718,9 @@ def main() -> None:
         "fused_modules": getattr(calculator, "fused_modules", []),
         "freeze_model_params_for_efs": getattr(calculator, "freeze_model_params_for_efs", None),
         "activation_calibration": activation_calibration,
+        "large_supercell_repeat": list(supercell_repeat),
+        "large_supercell_repeat_factor": supercell_repeat_factor,
+        "large_supercell_max_atoms": args.large_supercell_max_atoms,
         **precision_info,
     }
     if args.device == "cuda":

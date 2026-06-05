@@ -35,6 +35,10 @@ def _model_stage_profile_enabled() -> bool:
     )
 
 
+def _nvtx_ranges_enabled() -> bool:
+    return os.environ.get("MATRIS_NVTX_RANGES", "0") == "1" and torch.cuda.is_available()
+
+
 def _sync_if_needed_from_tensors(*values) -> None:
     if not torch.cuda.is_available():
         return
@@ -50,14 +54,22 @@ def _sync_if_needed_from_tensors(*values) -> None:
 
 
 def _timed_model_stage(profile: dict[str, float], name: str, sync_values: tuple, fn):
-    if not _model_stage_profile_enabled():
-        return fn()
-    _sync_if_needed_from_tensors(*sync_values)
-    start = time.perf_counter()
-    result = fn()
-    _sync_if_needed_from_tensors(result, *sync_values)
-    profile[name] = (time.perf_counter() - start) * 1000.0
-    return result
+    profile_enabled = _model_stage_profile_enabled()
+    nvtx_enabled = _nvtx_ranges_enabled()
+    if nvtx_enabled:
+        torch.cuda.nvtx.range_push(f"model.{name}")
+    try:
+        if not profile_enabled:
+            return fn()
+        _sync_if_needed_from_tensors(*sync_values)
+        start = time.perf_counter()
+        result = fn()
+        _sync_if_needed_from_tensors(result, *sync_values)
+        profile[name] = (time.perf_counter() - start) * 1000.0
+        return result
+    finally:
+        if nvtx_enabled:
+            torch.cuda.nvtx.range_pop()
 
 
 class MatRIS(nn.Module):

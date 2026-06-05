@@ -65,6 +65,10 @@ def _attn_line_record_function_enabled(profile_prefix: str) -> bool:
     )
 
 
+def _nvtx_ranges_enabled() -> bool:
+    return os.environ.get("MATRIS_NVTX_RANGES", "0") == "1" and torch.cuda.is_available()
+
+
 def _sync_if_cuda_tensor(*values) -> None:
     if not torch.cuda.is_available():
         return
@@ -2918,17 +2922,30 @@ class Graph_Attention_Layer(nn.Module):
 
         def timed_detail(stage_name: str, sync_values: tuple, fn):
             if not detail_profile and not record_function_profile:
-                return fn()
+                if not _nvtx_ranges_enabled():
+                    return fn()
+                label = f"{profile_prefix}.{stage_name}"
+                torch.cuda.nvtx.range_push(label)
+                try:
+                    return fn()
+                finally:
+                    torch.cuda.nvtx.range_pop()
             label = f"{profile_prefix}.{stage_name}"
-            with torch.profiler.record_function(label):
-                if detail_profile:
-                    _sync_if_cuda_tensor(*sync_values)
-                    start = time.perf_counter()
-                    result = fn()
-                    _sync_if_cuda_tensor(result, *sync_values)
-                    self.last_profile[f"{label}_ms"] = (time.perf_counter() - start) * 1000.0
-                else:
-                    result = fn()
+            if _nvtx_ranges_enabled():
+                torch.cuda.nvtx.range_push(label)
+            try:
+                with torch.profiler.record_function(label):
+                    if detail_profile:
+                        _sync_if_cuda_tensor(*sync_values)
+                        start = time.perf_counter()
+                        result = fn()
+                        _sync_if_cuda_tensor(result, *sync_values)
+                        self.last_profile[f"{label}_ms"] = (time.perf_counter() - start) * 1000.0
+                    else:
+                        result = fn()
+            finally:
+                if _nvtx_ranges_enabled():
+                    torch.cuda.nvtx.range_pop()
             return result
 
         def fused_node_update_residual_or_none(fusion_node_feat: Tensor) -> Tensor | None:
