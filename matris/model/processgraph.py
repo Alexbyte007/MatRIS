@@ -20,11 +20,17 @@ def _use_p83_line_attention_offsets() -> bool:
         or os.environ.get("MATRIS_P83B_LINE_ATTENTION_TARGET_OFFSETS", "0") == "1"
         or os.environ.get("MATRIS_P83C_LINE_ATTENTION_NODE_INPUT", "0") == "1"
         or os.environ.get("MATRIS_P108_A_CUDA3_ATTN_LINE_TARGET_REDUCE_BWD", "0") == "1"
+        or os.environ.get("MATRIS_P201_ALPHA_ATTENTION_RECOMPUTE", "0") == "1"
+        or os.environ.get("MATRIS_P203_SOURCE_SORTED_ATTENTION", "0") == "1"
     )
 
 
 def _use_p120_atom_attention_target_offsets() -> bool:
     return os.environ.get("MATRIS_P120_ATOM_ATTENTION_TARGET_OFFSETS", "0") == "1"
+
+
+def _use_p203_source_sorted_attention() -> bool:
+    return os.environ.get("MATRIS_P203_SOURCE_SORTED_ATTENTION", "0") == "1"
 
 
 def _segment_offsets_from_lengths(lengths: torch.Tensor) -> torch.Tensor:
@@ -307,6 +313,8 @@ def process_graphs(graphs: Sequence[RadiusGraph],
             line_graph_dict['target_segment_lengths'] = target_lengths_line_graph
             line_graph_dict['source_segment_offsets'] = _segment_offsets_from_lengths(source_lengths_line_graph)
             line_graph_dict['target_segment_offsets'] = _segment_offsets_from_lengths(target_lengths_line_graph)
+            if _use_p203_source_sorted_attention():
+                line_graph_dict['source_sort_order'] = torch.argsort(line_graph_UDE_source_index)
 
         line_graph_dict['source_bincount'] = source_lengths_line_graph.where(
             source_lengths_line_graph != 0,

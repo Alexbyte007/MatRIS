@@ -14,8 +14,13 @@ from .radiusgraph import Graph, Node, RadiusGraph
 from pymatgen.core import Structure
 
 try:
-    from .cygraph import line_graph_adjacency_list_fast, make_graph
+    from .cygraph import (
+        build_graph_tensors_fast,
+        line_graph_adjacency_list_fast,
+        make_graph,
+    )
 except (ImportError, AttributeError):
+    build_graph_tensors_fast = None
     make_graph = None
     line_graph_adjacency_list_fast = None
 
@@ -55,9 +60,11 @@ class GraphConverter(nn.Module):
             neighbor_backend or os.environ.get("MATRIS_GRAPH_BACKEND", "pymatgen")
         ).strip().lower()
         self.neighbor_device = neighbor_device or os.environ.get("MATRIS_NV_GRAPH_DEVICE")
-        self.neighbor_method = (
-            neighbor_method or os.environ.get("MATRIS_NV_GRAPH_METHOD", "naive")
-        ).strip()
+        method = neighbor_method
+        if method is None:
+            method = os.environ.get("MATRIS_NV_GRAPH_METHOD", "auto")
+        method = method.strip().lower() if isinstance(method, str) else method
+        self.neighbor_method = None if method in ("", "auto", "none") else method
         
         if make_graph is not None:
             self.create_graph = self._create_graph_fast
@@ -106,6 +113,50 @@ class GraphConverter(nn.Module):
         lattice = torch.tensor( structure.lattice.matrix, dtype=datatype )
         
         center_index, neighbor_index, image, distance = self._get_neighbor_list(structure)
+        if (
+            self.neighbor_backend in ("nvalchemi", "nv", "nvidia")
+            and os.environ.get("MATRIS_NV_GRAPH_TENSOR_PATH", "0") == "1"
+        ):
+            if build_graph_tensors_fast is not None:
+                atom_graph, directed2undirected, undirected2directed, line_graph = (
+                    self._build_graph_tensors_fast(
+                        n_atoms,
+                        center_index,
+                        neighbor_index,
+                        image,
+                        distance,
+                    )
+                )
+            else:
+                atom_graph, directed2undirected, undirected2directed, line_graph = (
+                    self._build_graph_tensors_from_edges(
+                        n_atoms,
+                        center_index,
+                        neighbor_index,
+                        image,
+                        distance,
+                    )
+                )
+            n_isolated_atoms = len({*range(n_atoms)} - {*center_index})
+            if n_isolated_atoms:
+                error = f"Error: Detected {n_isolated_atoms} isolated atom. Calculation stopped"
+                raise ValueError(error)
+            return RadiusGraph(
+                atomic_number=atomic_number,
+                atom_frac_coord=atom_frac_coord,
+                atom_graph=atom_graph,
+                neighbor_image=torch.tensor(image, dtype=datatype),
+                directed2undirected=directed2undirected,
+                undirected2directed=undirected2directed,
+                line_graph=line_graph,
+                lattice=lattice,
+                graph_id=graph_id,
+                mp_id=mp_id,
+                composition=structure.composition.formula,
+                atom_graph_cutoff=self.atom_graph_cutoff,
+                line_graph_cutoff=self.line_graph_cutoff,
+            )
+
         # Ceate atom graph
         graph = self.create_graph(
             n_atoms, center_index, neighbor_index, image, distance
@@ -229,6 +280,130 @@ class GraphConverter(nn.Module):
         distance = torch.linalg.norm(edge_vectors, dim=1)
         distance = distance.detach().cpu().numpy().astype(np.float64, copy=False)
         return center_index, neighbor_index, image, distance
+
+    def _build_graph_tensors_fast(
+        self,
+        n_atoms: int,
+        center_index: np.ndarray,
+        neighbor_index: np.ndarray,
+        image: np.ndarray,
+        distance: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        center_index = np.ascontiguousarray(center_index, dtype=np.int_)
+        neighbor_index = np.ascontiguousarray(neighbor_index, dtype=np.int_)
+        image = np.ascontiguousarray(image, dtype=np.int_)
+        distance = np.ascontiguousarray(distance, dtype=np.float64)
+        (
+            atom_graph_np,
+            directed2undirected_np,
+            undirected2directed_np,
+            line_graph_np,
+        ) = build_graph_tensors_fast(
+            center_index,
+            len(center_index),
+            neighbor_index,
+            image,
+            distance,
+            n_atoms,
+            self.line_graph_cutoff,
+        )
+        return (
+            torch.from_numpy(atom_graph_np),
+            torch.from_numpy(directed2undirected_np),
+            torch.from_numpy(undirected2directed_np),
+            torch.from_numpy(line_graph_np),
+        )
+
+    def _build_graph_tensors_from_edges(
+        self,
+        n_atoms: int,
+        center_index: np.ndarray,
+        neighbor_index: np.ndarray,
+        image: np.ndarray,
+        distance: np.ndarray,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        center_index = np.asarray(center_index, dtype=np.int64)
+        neighbor_index = np.asarray(neighbor_index, dtype=np.int64)
+        image = np.asarray(image, dtype=np.int64)
+        distance = np.asarray(distance, dtype=np.float64)
+        num_edges = int(center_index.shape[0])
+
+        atom_graph_np = np.empty((num_edges, 2), dtype=np.int32)
+        atom_graph_np[:, 0] = center_index.astype(np.int32, copy=False)
+        atom_graph_np[:, 1] = neighbor_index.astype(np.int32, copy=False)
+
+        directed2undirected_np = np.empty(num_edges, dtype=np.int32)
+        undirected2directed = []
+        ude_directed_edges: list[list[int]] = []
+        ude_nodes: list[tuple[int, int]] = []
+        ude_distance: list[float] = []
+        key_to_ude: dict[tuple, int] = {}
+
+        def canonical_key(i: int, j: int, img_tuple: tuple[int, int, int]) -> tuple:
+            forward = (i, j, img_tuple)
+            reverse = (j, i, (-img_tuple[0], -img_tuple[1], -img_tuple[2]))
+            return forward if forward <= reverse else reverse
+
+        outgoing: list[list[int]] = [[] for _ in range(n_atoms)]
+        for de_idx in range(num_edges):
+            i = int(center_index[de_idx])
+            j = int(neighbor_index[de_idx])
+            img_tuple = (
+                int(image[de_idx, 0]),
+                int(image[de_idx, 1]),
+                int(image[de_idx, 2]),
+            )
+            key = canonical_key(i, j, img_tuple)
+            ude_idx = key_to_ude.get(key)
+            if ude_idx is None:
+                ude_idx = len(ude_directed_edges)
+                key_to_ude[key] = ude_idx
+                ude_directed_edges.append([])
+                ude_nodes.append((i, j))
+                ude_distance.append(float(distance[de_idx]))
+                undirected2directed.append(de_idx)
+            directed2undirected_np[de_idx] = ude_idx
+            ude_directed_edges[ude_idx].append(de_idx)
+            outgoing[i].append(de_idx)
+
+        bad_pairs = [idx for idx, edges in enumerate(ude_directed_edges) if len(edges) != 2]
+        if bad_pairs:
+            raise ValueError(
+                "Tensor graph path expected exactly 2 directed edges per undirected edge; "
+                f"found {len(bad_pairs)} invalid groups, first={bad_pairs[:5]}"
+            )
+
+        line_rows: list[list[int]] = []
+        cutoff = float(self.line_graph_cutoff)
+        for ude_idx, de_pair in enumerate(ude_directed_edges):
+            if ude_distance[ude_idx] > cutoff:
+                continue
+            for de_idx in de_pair:
+                center = int(center_index[de_idx])
+                for other_de in outgoing[center]:
+                    if other_de == de_idx:
+                        continue
+                    if float(distance[other_de]) < cutoff:
+                        line_rows.append(
+                            [
+                                center,
+                                ude_idx,
+                                de_idx,
+                                int(directed2undirected_np[other_de]),
+                                other_de,
+                            ]
+                        )
+
+        line_graph_np = np.asarray(line_rows, dtype=np.int32)
+        if line_graph_np.size == 0:
+            line_graph_np = np.empty((0, 5), dtype=np.int32)
+
+        return (
+            torch.from_numpy(atom_graph_np),
+            torch.from_numpy(directed2undirected_np),
+            torch.tensor(undirected2directed, dtype=torch.int32),
+            torch.from_numpy(line_graph_np),
+        )
 
     @staticmethod
     def _create_graph_legacy(

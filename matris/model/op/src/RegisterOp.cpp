@@ -20,7 +20,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("quant_ffn_w8a8_static_cutlass_grouped_pair", &quant_ffn_w8a8_static_cutlass_grouped_pair, "quant_ffn_w8a8_static_cutlass_grouped_pair");
     m.def("quant_linear_w8a8_static_wmma_dual", &quant_linear_w8a8_static_wmma_dual, "quant_linear_w8a8_static_wmma_dual");
     m.def("target_attention_sum_forward", &target_attention_sum_forward, "target_attention_sum_forward");
+    m.def("target_attention_sum_forward_no_alpha",
+          &target_attention_sum_forward_no_alpha,
+          "target_attention_sum_forward_no_alpha");
     m.def("target_attention_sum_backward", &target_attention_sum_backward, "target_attention_sum_backward");
+    m.def("target_attention_sum_backward_recompute",
+          &target_attention_sum_backward_recompute,
+          "target_attention_sum_backward_recompute");
     m.def("directed2undirected_average_forward", &directed2undirected_average_forward, "directed2undirected_average_forward");
     m.def("directed2undirected_average_backward", &directed2undirected_average_backward, "directed2undirected_average_backward");
     m.def("edge_vectors_forward", &edge_vectors_forward, "edge_vectors_forward");
@@ -38,10 +44,28 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("fused_line_attention_forward_target_offsets",
           &fused_line_attention_forward_target_offsets,
           "P83B fused_line_attention_forward_target_offsets");
+    m.def("fused_line_attention_forward_recompute",
+          &fused_line_attention_forward_recompute,
+          "P201 fused line attention forward without saved alpha");
+    m.def("fused_line_attention_forward_recompute_source_offsets",
+          &fused_line_attention_forward_recompute_source_offsets,
+          "P203 fused line attention forward with source-sorted offsets");
     m.def("fused_line_attention_node_input_forward_target_offsets",
           &fused_line_attention_node_input_forward_target_offsets,
           "P83C fused_line_attention_node_input_forward_target_offsets");
     m.def("fused_line_attention_backward", &fused_line_attention_backward, "fused_line_attention_backward");
+    m.def("fused_line_attention_backward_recompute",
+          &fused_line_attention_backward_recompute,
+          "P201 fused line attention backward recomputing alpha");
+    m.def("fused_line_attention_backward_recompute_source_offsets",
+          &fused_line_attention_backward_recompute_source_offsets,
+          "P203 fused line attention backward with source-sorted offsets");
+    m.def("fused_line_attention_backward_recompute_source",
+          &fused_line_attention_backward_recompute_source,
+          "P201 low-memory source backward recomputing alpha");
+    m.def("fused_line_attention_backward_recompute_target_add",
+          &fused_line_attention_backward_recompute_target_add,
+          "P201 low-memory target backward recomputing alpha and adding grad_values");
     m.def("fused_line_attention_backward_with_edge_direct",
           &fused_line_attention_backward_with_edge_direct,
           "P106 fused_line_attention_backward with direct edge grad accumulation");
@@ -220,7 +244,9 @@ TORCH_LIBRARY(matris_op, m)
     m.def("quant_ffn_w8a8_static_cutlass_grouped_pair", &quant_ffn_w8a8_static_cutlass_grouped_pair);
     m.def("quant_linear_w8a8_static_wmma_dual", &quant_linear_w8a8_static_wmma_dual);
     m.def("target_attention_sum_forward", &target_attention_sum_forward);
+    m.def("target_attention_sum_forward_no_alpha", &target_attention_sum_forward_no_alpha);
     m.def("target_attention_sum_backward", &target_attention_sum_backward);
+    m.def("target_attention_sum_backward_recompute", &target_attention_sum_backward_recompute);
     m.def("directed2undirected_average_forward", &directed2undirected_average_forward);
     m.def("directed2undirected_average_backward", &directed2undirected_average_backward);
     m.def("edge_vectors_forward", &edge_vectors_forward);
@@ -232,9 +258,17 @@ TORCH_LIBRARY(matris_op, m)
     m.def("fused_line_attention_single_max_atomic", &fused_line_attention_single_max_atomic);
     m.def("fused_line_attention_forward_with_max", &fused_line_attention_forward_with_max);
     m.def("fused_line_attention_forward_target_offsets", &fused_line_attention_forward_target_offsets);
+    m.def("fused_line_attention_forward_recompute", &fused_line_attention_forward_recompute);
+    m.def("fused_line_attention_forward_recompute_source_offsets",
+          &fused_line_attention_forward_recompute_source_offsets);
     m.def("fused_line_attention_node_input_forward_target_offsets",
           &fused_line_attention_node_input_forward_target_offsets);
     m.def("fused_line_attention_backward", &fused_line_attention_backward);
+    m.def("fused_line_attention_backward_recompute", &fused_line_attention_backward_recompute);
+    m.def("fused_line_attention_backward_recompute_source_offsets",
+          &fused_line_attention_backward_recompute_source_offsets);
+    m.def("fused_line_attention_backward_recompute_source", &fused_line_attention_backward_recompute_source);
+    m.def("fused_line_attention_backward_recompute_target_add", &fused_line_attention_backward_recompute_target_add);
     m.def("fused_line_attention_backward_with_edge_direct",
           &fused_line_attention_backward_with_edge_direct);
     m.def("fused_line_attention_values_backward_with_edge_direct",

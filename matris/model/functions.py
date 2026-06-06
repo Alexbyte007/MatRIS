@@ -329,6 +329,32 @@ def _use_cuda_target_attention_bwd() -> bool:
     return os.environ.get("MATRIS_USE_CUDA_TARGET_ATTENTION_BWD", "0") == "1"
 
 
+def _use_cuda_target_attention_recompute() -> bool:
+    return os.environ.get("MATRIS_USE_CUDA_TARGET_ATTENTION_RECOMPUTE", "0") == "1"
+
+
+def _use_p201_alpha_attention_recompute() -> bool:
+    return os.environ.get("MATRIS_P201_ALPHA_ATTENTION_RECOMPUTE", "0") == "1"
+
+
+def _p201_record_function(name: str):
+    if os.environ.get("MATRIS_P201_RECORD_FUNCTION", "0") == "1":
+        return torch.profiler.record_function(name)
+    return contextlib.nullcontext()
+
+
+def _use_p201_low_memory_backward() -> bool:
+    return os.environ.get("MATRIS_P201_LOW_MEMORY_BWD", "0") == "1"
+
+
+def _use_p203_source_sorted_attention() -> bool:
+    return os.environ.get("MATRIS_P203_SOURCE_SORTED_ATTENTION", "0") == "1"
+
+
+def _use_p203_low_memory_backward() -> bool:
+    return os.environ.get("MATRIS_P203_LOW_MEMORY_BWD", "0") == "1"
+
+
 def _use_cuda_directed2undirected_average() -> bool:
     return os.environ.get("MATRIS_USE_CUDA_DIRECTED2UNDIRECTED_AVERAGE", "0") == "1"
 
@@ -3035,6 +3061,39 @@ class _CudaTargetAttentionSum(torch.autograd.Function):
         return grad_logits, grad_values, None
 
 
+class _CudaTargetAttentionRecompute(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, alpha_logits: Tensor, values: Tensor, lengths: Tensor) -> Tensor:
+        matris_op = _load_matris_op()
+        if (
+            matris_op is None
+            or not hasattr(matris_op, "target_attention_sum_forward_no_alpha")
+            or not hasattr(matris_op, "target_attention_sum_backward_recompute")
+        ):
+            raise RuntimeError("matris_op target attention recompute ops are unavailable")
+        alpha_logits = alpha_logits.contiguous()
+        values = values.contiguous()
+        lengths = lengths.to(device=alpha_logits.device, dtype=torch.int64).contiguous()
+        out = matris_op.target_attention_sum_forward_no_alpha(alpha_logits, values, lengths)
+        ctx.save_for_backward(alpha_logits, values, out, lengths)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        alpha_logits, values, out, lengths = ctx.saved_tensors
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "target_attention_sum_backward_recompute"):
+            raise RuntimeError("matris_op.target_attention_sum_backward_recompute is unavailable")
+        grad_logits, grad_values = matris_op.target_attention_sum_backward_recompute(
+            grad_out.contiguous(),
+            alpha_logits,
+            values,
+            out,
+            lengths,
+        )
+        return grad_logits, grad_values, None
+
+
 class _CudaTargetAttentionBackward(torch.autograd.Function):
     @staticmethod
     def forward(ctx, alpha_logits: Tensor, values: Tensor, segment: Tensor, lengths: Tensor) -> Tensor:
@@ -3294,6 +3353,240 @@ class _CudaFusedLineAttention(torch.autograd.Function):
         return grad_source_logits, grad_target_logits, grad_values, None, None, None, None, None
 
 
+class _CudaAlphaProjectLineAttentionRecompute(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        edge_feat: Tensor,
+        values: Tensor,
+        source_weight: Tensor,
+        source_bias: Tensor | None,
+        target_weight: Tensor,
+        target_bias: Tensor | None,
+        source_index: Tensor,
+        target_offsets: Tensor,
+        num_segments: int,
+        source_offsets: Tensor | None = None,
+        source_order: Tensor | None = None,
+    ):
+        matris_op = _load_matris_op()
+        if (
+            matris_op is None
+            or not hasattr(matris_op, "fused_line_attention_forward_recompute")
+            or not hasattr(matris_op, "fused_line_attention_backward_recompute")
+        ):
+            raise RuntimeError("matris_op fused line attention recompute ops are unavailable")
+        edge_feat_c = edge_feat.contiguous()
+        values_c = values.contiguous()
+        source_weight_c = source_weight.contiguous()
+        target_weight_c = target_weight.contiguous()
+        source_bias_c = source_bias.contiguous() if isinstance(source_bias, Tensor) else None
+        target_bias_c = target_bias.contiguous() if isinstance(target_bias, Tensor) else None
+        with _p201_record_function("P201.forward.source_alpha_projection"):
+            source_logits = F.linear(edge_feat_c, source_weight_c, source_bias_c)
+        with _p201_record_function("P201.forward.target_alpha_projection"):
+            target_logits = F.linear(edge_feat_c, target_weight_c, target_bias_c)
+        source_index_c = source_index.contiguous()
+        target_offsets_c = target_offsets.contiguous()
+        use_p203 = (
+            _use_p203_source_sorted_attention()
+            and isinstance(source_offsets, Tensor)
+            and isinstance(source_order, Tensor)
+            and hasattr(matris_op, "fused_line_attention_forward_recompute_source_offsets")
+            and hasattr(matris_op, "fused_line_attention_backward_recompute_source_offsets")
+        )
+        with _p201_record_function("P201.forward.attention_recompute_no_alpha"):
+            if use_p203:
+                source_offsets_c = source_offsets.contiguous()
+                source_order_c = source_order.contiguous()
+                source_out, target_out = matris_op.fused_line_attention_forward_recompute_source_offsets(
+                    source_logits,
+                    target_logits,
+                    values_c,
+                    source_offsets_c,
+                    source_order_c,
+                    target_offsets_c,
+                    int(num_segments),
+                )
+            else:
+                source_offsets_c = source_index_c
+                source_order_c = source_index_c
+                source_out, target_out = matris_op.fused_line_attention_forward_recompute(
+                    source_logits,
+                    target_logits,
+                    values_c,
+                    source_index_c,
+                    target_offsets_c,
+                    int(num_segments),
+                )
+        ctx.save_for_backward(
+            edge_feat_c,
+            values_c,
+            source_weight_c,
+            target_weight_c,
+            source_index_c,
+            target_offsets_c,
+            source_offsets_c,
+            source_order_c,
+            source_out,
+            target_out,
+        )
+        ctx.has_source_bias = isinstance(source_bias, Tensor)
+        ctx.has_target_bias = isinstance(target_bias, Tensor)
+        ctx.num_segments = int(num_segments)
+        ctx.use_p203 = bool(use_p203)
+        return source_out, target_out
+
+    @staticmethod
+    def backward(ctx, grad_source_out: Tensor, grad_target_out: Tensor):
+        (
+            edge_feat,
+            values,
+            source_weight,
+            target_weight,
+            source_index,
+            target_offsets,
+            source_offsets,
+            source_order,
+            source_out,
+            target_out,
+        ) = ctx.saved_tensors
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "fused_line_attention_backward_recompute"):
+            raise RuntimeError("matris_op.fused_line_attention_backward_recompute is unavailable")
+        if bool(getattr(ctx, "use_p203", False)):
+            if not hasattr(matris_op, "fused_line_attention_backward_recompute_source_offsets"):
+                raise RuntimeError("matris_op.fused_line_attention_backward_recompute_source_offsets is unavailable")
+            with _p201_record_function("P203.backward.recompute_source_logits"):
+                source_logits = F.linear(edge_feat, source_weight, None)
+            with _p201_record_function("P203.backward.recompute_target_logits"):
+                target_logits = F.linear(edge_feat, target_weight, None)
+            with _p201_record_function("P203.backward.attention_recompute_source_offsets"):
+                grad_source_logits, grad_target_logits, grad_values = (
+                    matris_op.fused_line_attention_backward_recompute_source_offsets(
+                        grad_source_out.contiguous(),
+                        grad_target_out.contiguous(),
+                        source_logits.contiguous(),
+                        target_logits.contiguous(),
+                        values,
+                        source_out,
+                        target_out,
+                        source_offsets,
+                        source_order,
+                        target_offsets,
+                        int(ctx.num_segments),
+                    )
+                )
+            with _p201_record_function("P203.backward.source_alpha_input_grad_gemm"):
+                grad_edge_feat = grad_source_logits.contiguous().matmul(source_weight)
+            if _use_p203_low_memory_backward():
+                with _p201_record_function("P203.backward.v2.target_alpha_input_grad_gemm_add"):
+                    grad_edge_feat.addmm_(grad_target_logits.contiguous(), target_weight)
+            else:
+                with _p201_record_function("P203.backward.target_alpha_input_grad_gemm"):
+                    grad_target_edge_feat = grad_target_logits.contiguous().matmul(target_weight)
+                with _p201_record_function("P203.backward.grad_edge_add"):
+                    grad_edge_feat = grad_edge_feat + grad_target_edge_feat
+            return (
+                grad_edge_feat,
+                grad_values,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        if (
+            _use_p201_low_memory_backward()
+            and hasattr(matris_op, "fused_line_attention_backward_recompute_source")
+            and hasattr(matris_op, "fused_line_attention_backward_recompute_target_add")
+        ):
+            with _p201_record_function("P201.backward.v2.recompute_source_logits"):
+                source_logits = F.linear(edge_feat, source_weight, None)
+            with _p201_record_function("P201.backward.v2.source_attention_recompute"):
+                grad_source_logits, grad_values = matris_op.fused_line_attention_backward_recompute_source(
+                    grad_source_out.contiguous(),
+                    source_logits.contiguous(),
+                    values,
+                    source_out,
+                    source_index,
+                    int(ctx.num_segments),
+                )
+            source_logits = None
+            with _p201_record_function("P201.backward.v2.source_alpha_input_grad_gemm"):
+                grad_edge_feat = grad_source_logits.contiguous().matmul(source_weight)
+            grad_source_logits = None
+
+            with _p201_record_function("P201.backward.v2.recompute_target_logits"):
+                target_logits = F.linear(edge_feat, target_weight, None)
+            with _p201_record_function("P201.backward.v2.target_attention_recompute"):
+                grad_target_logits, grad_values = matris_op.fused_line_attention_backward_recompute_target_add(
+                    grad_target_out.contiguous(),
+                    target_logits.contiguous(),
+                    values,
+                    target_out,
+                    target_offsets,
+                    grad_values,
+                    int(ctx.num_segments),
+                )
+            target_logits = None
+            with _p201_record_function("P201.backward.v2.target_alpha_input_grad_gemm_add"):
+                grad_edge_feat.addmm_(grad_target_logits.contiguous(), target_weight)
+            return (
+                grad_edge_feat,
+                grad_values,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        with _p201_record_function("P201.backward.recompute_source_logits"):
+            source_logits = F.linear(edge_feat, source_weight, None)
+        with _p201_record_function("P201.backward.recompute_target_logits"):
+            target_logits = F.linear(edge_feat, target_weight, None)
+        with _p201_record_function("P201.backward.attention_recompute"):
+            grad_source_logits, grad_target_logits, grad_values = matris_op.fused_line_attention_backward_recompute(
+                grad_source_out.contiguous(),
+                grad_target_out.contiguous(),
+                source_logits.contiguous(),
+                target_logits.contiguous(),
+                values,
+                source_out,
+                target_out,
+                source_index,
+                target_offsets,
+                int(ctx.num_segments),
+            )
+        with _p201_record_function("P201.backward.source_alpha_input_grad_gemm"):
+            grad_edge_feat = grad_source_logits.contiguous().matmul(source_weight)
+        with _p201_record_function("P201.backward.target_alpha_input_grad_gemm"):
+            grad_target_edge_feat = grad_target_logits.contiguous().matmul(target_weight)
+        with _p201_record_function("P201.backward.grad_edge_add"):
+            grad_edge_feat = grad_edge_feat + grad_target_edge_feat
+        return (
+            grad_edge_feat,
+            grad_values,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class _CudaFusedLineAttentionNodeInput(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -3418,6 +3711,80 @@ def fused_line_attention_or_none(
         return None
 
 
+def alpha_project_line_attention_recompute_or_none(
+    edge_feat: Tensor,
+    values: Tensor,
+    source_linear: nn.Linear,
+    target_linear: nn.Linear,
+    source_index: Tensor,
+    target_offsets: Tensor | None,
+    num_segments: int,
+    *,
+    enable_hint: bool,
+    source_offsets: Tensor | None = None,
+    source_order: Tensor | None = None,
+) -> tuple[Tensor, Tensor] | None:
+    if not _use_p201_alpha_attention_recompute() or not enable_hint:
+        return None
+    matris_op = _load_matris_op()
+    if (
+        matris_op is None
+        or not hasattr(matris_op, "fused_line_attention_forward_recompute")
+        or not hasattr(matris_op, "fused_line_attention_backward_recompute")
+    ):
+        return None
+    if (
+        target_offsets is None
+        or not isinstance(source_linear, nn.Linear)
+        or not isinstance(target_linear, nn.Linear)
+        or edge_feat.ndim != 2
+        or values.ndim != 2
+        or edge_feat.shape[0] != values.shape[0]
+        or values.shape[1] != 128
+        or edge_feat.dtype != torch.float32
+        or values.dtype != torch.float32
+        or source_linear.weight.dtype != torch.float32
+        or target_linear.weight.dtype != torch.float32
+        or source_linear.weight.shape != target_linear.weight.shape
+        or source_linear.weight.shape[0] != 128
+        or source_linear.weight.shape[1] != edge_feat.shape[1]
+        or source_index.dtype != torch.int64
+        or target_offsets.dtype != torch.int64
+        or (source_offsets is not None and source_offsets.dtype != torch.int64)
+        or (source_order is not None and source_order.dtype != torch.int64)
+        or not edge_feat.is_cuda
+        or not values.is_cuda
+        or not source_linear.weight.is_cuda
+        or not target_linear.weight.is_cuda
+        or not source_index.is_cuda
+        or not target_offsets.is_cuda
+        or (source_offsets is not None and not source_offsets.is_cuda)
+        or (source_order is not None and not source_order.is_cuda)
+        or target_offsets.ndim != 1
+        or target_offsets.numel() != int(num_segments) + 1
+        or (source_offsets is not None and (source_offsets.ndim != 1 or source_offsets.numel() != int(num_segments) + 1))
+        or (source_order is not None and (source_order.ndim != 1 or source_order.numel() != edge_feat.shape[0]))
+    ):
+        return None
+    try:
+        source_out, target_out = _CudaAlphaProjectLineAttentionRecompute.apply(
+            edge_feat,
+            values,
+            source_linear.weight,
+            source_linear.bias,
+            target_linear.weight,
+            target_linear.bias,
+            source_index,
+            target_offsets,
+            int(num_segments),
+            source_offsets,
+            source_order,
+        )
+        return source_out, target_out
+    except RuntimeError:
+        return None
+
+
 def fused_line_attention_node_input_or_none(
     source_logits: Tensor,
     target_logits: Tensor,
@@ -3524,7 +3891,11 @@ def segment_softmax_weighted_sum_sorted_or_none(
     enable_hint: bool,
 ) -> Tensor | None:
     if not _use_triton_target_attention_sum() or not enable_hint or triton is None:
-        if not (_use_cuda_target_attention_sum() or _use_cuda_target_attention_bwd()) or not enable_hint:
+        if not (
+            _use_cuda_target_attention_sum()
+            or _use_cuda_target_attention_bwd()
+            or _use_cuda_target_attention_recompute()
+        ) or not enable_hint:
             return None
     if alpha_logits.ndim != 2 or alpha_logits.shape != values.shape or alpha_logits.shape[1] != 128:
         return None
@@ -3534,6 +3905,11 @@ def segment_softmax_weighted_sum_sorted_or_none(
         return None
     resolved_num_segment = int(num_segment) if num_segment is not None else int(segment.max().item()) + 1
     lengths = torch.bincount(segment, minlength=resolved_num_segment).to(torch.int64)
+    if _use_cuda_target_attention_recompute():
+        try:
+            return _CudaTargetAttentionRecompute.apply(alpha_logits, values, lengths)
+        except RuntimeError:
+            return None
     if _use_cuda_target_attention_sum():
         try:
             return _CudaTargetAttentionSum.apply(alpha_logits, values, lengths)

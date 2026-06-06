@@ -189,11 +189,21 @@ std::vector<torch::Tensor> target_attention_sum_forward(const torch::Tensor &log
                                                         const torch::Tensor &values,
                                                         const torch::Tensor &lengths);
 
+torch::Tensor target_attention_sum_forward_no_alpha(const torch::Tensor &logits,
+                                                    const torch::Tensor &values,
+                                                    const torch::Tensor &lengths);
+
 std::vector<torch::Tensor> target_attention_sum_backward(const torch::Tensor &grad_out,
                                                          const torch::Tensor &values,
                                                          const torch::Tensor &out,
                                                          const torch::Tensor &alpha,
                                                          const torch::Tensor &lengths);
+
+std::vector<torch::Tensor> target_attention_sum_backward_recompute(const torch::Tensor &grad_out,
+                                                                   const torch::Tensor &logits,
+                                                                   const torch::Tensor &values,
+                                                                   const torch::Tensor &out,
+                                                                   const torch::Tensor &lengths);
 
 torch::Tensor directed2undirected_average_forward(const torch::Tensor &input,
                                                   const torch::Tensor &segment,
@@ -264,6 +274,22 @@ std::vector<torch::Tensor> fused_line_attention_forward_target_offsets(const tor
                                                                        const torch::Tensor &target_offsets,
                                                                        int64_t num_segments);
 
+std::vector<torch::Tensor> fused_line_attention_forward_recompute(const torch::Tensor &source_logits,
+                                                                  const torch::Tensor &target_logits,
+                                                                  const torch::Tensor &values,
+                                                                  const torch::Tensor &source_index,
+                                                                  const torch::Tensor &target_offsets,
+                                                                  int64_t num_segments);
+
+std::vector<torch::Tensor> fused_line_attention_forward_recompute_source_offsets(
+    const torch::Tensor &source_logits,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_offsets,
+    const torch::Tensor &source_order,
+    const torch::Tensor &target_offsets,
+    int64_t num_segments);
+
 std::vector<torch::Tensor> fused_line_attention_node_input_forward_target_offsets(
     const torch::Tensor &source_logits,
     const torch::Tensor &target_logits,
@@ -283,6 +309,45 @@ std::vector<torch::Tensor> fused_line_attention_backward(const torch::Tensor &gr
                                                          const torch::Tensor &target_alpha,
                                                          const torch::Tensor &source_index,
                                                          const torch::Tensor &target_index);
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute(const torch::Tensor &grad_source_out,
+                                                                   const torch::Tensor &grad_target_out,
+                                                                   const torch::Tensor &source_logits,
+                                                                   const torch::Tensor &target_logits,
+                                                                   const torch::Tensor &values,
+                                                                   const torch::Tensor &source_out,
+                                                                   const torch::Tensor &target_out,
+                                                                   const torch::Tensor &source_index,
+                                                                   const torch::Tensor &target_offsets,
+                                                                   int64_t num_segments);
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute_source_offsets(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &source_logits,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &target_out,
+    const torch::Tensor &source_offsets,
+    const torch::Tensor &source_order,
+    const torch::Tensor &target_offsets,
+    int64_t num_segments);
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute_source(const torch::Tensor &grad_source_out,
+                                                                          const torch::Tensor &source_logits,
+                                                                          const torch::Tensor &values,
+                                                                          const torch::Tensor &source_out,
+                                                                          const torch::Tensor &source_index,
+                                                                          int64_t num_segments);
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute_target_add(const torch::Tensor &grad_target_out,
+                                                                              const torch::Tensor &target_logits,
+                                                                              const torch::Tensor &values,
+                                                                              const torch::Tensor &target_out,
+                                                                              const torch::Tensor &target_offsets,
+                                                                              const torch::Tensor &grad_values,
+                                                                              int64_t num_segments);
 
 std::vector<torch::Tensor> fused_line_attention_backward_with_edge_direct(
     const torch::Tensor &grad_source_out,

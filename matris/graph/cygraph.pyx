@@ -16,6 +16,7 @@
 from . import radiusgraph
 import numpy as np
 from libc.stdlib cimport free
+cimport numpy as cnp
 
 cdef extern from 'fast_converter_libraries/create_graph.c':
     ctypedef struct Node:
@@ -66,6 +67,154 @@ cdef extern from 'fast_converter_libraries/create_graph.c':
 
 
     LongToDirectedEdgeList** get_neighbors(Node* node)
+
+cdef void _free_returned_graph(ReturnElems2* returned):
+    cdef long idx
+    if returned == NULL:
+        return
+
+    for idx in range(returned[0].num_directed_edges):
+        free(returned[0].directed_edges_list[idx])
+
+    for idx in range(returned[0].num_undirected_edges):
+        free(returned[0].undirected_edges_list[idx].directed_edge_indices)
+        free(returned[0].undirected_edges_list[idx])
+
+    free_LongToDirectedEdgeList_in_nodes(returned[0].nodes, returned[0].num_nodes)
+
+    free(returned[0].directed_edges_list)
+    free(returned[0].undirected_edges_list)
+    free(returned[0].nodes)
+    free(returned)
+
+
+def build_graph_tensors_fast(
+        const long[::1] center_index,
+        const long n_e,
+        const long[::1] neighbor_index,
+        const long[:, ::1] image,
+        const double[::1] distance,
+        const long num_atoms,
+        const double line_graph_cutoff,
+    ):
+    """Build MatRIS graph tensors directly from edge arrays.
+
+    This uses the existing C create_graph implementation to preserve directed
+    edge and undirected edge ordering, but returns compact numpy arrays instead
+    of creating Python Node/Edge/Graph objects.
+    """
+    cdef ReturnElems2* returned
+    returned = <ReturnElems2*> create_graph(
+        <long*> &center_index[0],
+        n_e,
+        <long*> &neighbor_index[0],
+        <long*> &image[0][0],
+        <double*> &distance[0],
+        num_atoms,
+    )
+
+    cdef long num_directed_edges = returned[0].num_directed_edges
+    cdef long num_undirected_edges = returned[0].num_undirected_edges
+    cdef long line_rows = 0
+    cdef long idx
+    cdef long j
+    cdef long k
+    cdef long de_idx
+    cdef long center
+    cdef long row
+    cdef Node this_node
+    cdef UndirectedEdge* u_edge
+    cdef DirectedEdge* directed_edge
+    cdef LongToDirectedEdgeList** node_neighbors
+    cdef LongToDirectedEdgeList this_entry
+
+    cdef cnp.ndarray[cnp.int32_t, ndim=2] atom_graph_np
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] directed2undirected_np
+    cdef cnp.ndarray[cnp.int32_t, ndim=1] undirected2directed_np
+    cdef cnp.ndarray[cnp.int32_t, ndim=2] line_graph_np
+
+    try:
+        atom_graph_np = np.empty((num_directed_edges, 2), dtype=np.int32)
+        directed2undirected_np = np.empty(num_directed_edges, dtype=np.int32)
+        undirected2directed_np = np.empty(num_undirected_edges, dtype=np.int32)
+
+        for idx in range(num_directed_edges):
+            directed_edge = returned[0].directed_edges_list[idx]
+            atom_graph_np[idx, 0] = <cnp.int32_t> directed_edge[0].nodes.center
+            atom_graph_np[idx, 1] = <cnp.int32_t> directed_edge[0].nodes.neighbor
+            directed2undirected_np[idx] = (
+                <cnp.int32_t> directed_edge[0].undirected_edge_index
+            )
+
+        for idx in range(num_undirected_edges):
+            u_edge = returned[0].undirected_edges_list[idx]
+            if u_edge[0].num_directed_edges < 1:
+                raise ValueError("Undirected edge without directed edge")
+            undirected2directed_np[idx] = (
+                <cnp.int32_t> u_edge[0].directed_edge_indices[0]
+            )
+
+        for idx in range(num_undirected_edges):
+            u_edge = returned[0].undirected_edges_list[idx]
+            if u_edge[0].distance > line_graph_cutoff:
+                continue
+            if u_edge[0].num_directed_edges != 2:
+                raise ValueError(
+                    "Expected exactly 2 directed edges per undirected edge"
+                )
+            for j in range(2):
+                de_idx = u_edge[0].directed_edge_indices[j]
+                center = returned[0].directed_edges_list[de_idx][0].nodes.center
+                this_node = returned[0].nodes[center]
+                node_neighbors = get_neighbors(&this_node)
+                for k in range(this_node.num_neighbors):
+                    this_entry = node_neighbors[k][0]
+                    for row in range(this_entry.num_directed_edges_in_group):
+                        directed_edge = this_entry.directed_edges_list[row]
+                        if directed_edge[0].index == de_idx:
+                            continue
+                        if directed_edge[0].distance < line_graph_cutoff:
+                            line_rows += 1
+                free(node_neighbors)
+
+        line_graph_np = np.empty((line_rows, 5), dtype=np.int32)
+        row = 0
+        for idx in range(num_undirected_edges):
+            u_edge = returned[0].undirected_edges_list[idx]
+            if u_edge[0].distance > line_graph_cutoff:
+                continue
+            for j in range(2):
+                de_idx = u_edge[0].directed_edge_indices[j]
+                center = returned[0].directed_edges_list[de_idx][0].nodes.center
+                this_node = returned[0].nodes[center]
+                node_neighbors = get_neighbors(&this_node)
+                for k in range(this_node.num_neighbors):
+                    this_entry = node_neighbors[k][0]
+                    for line_rows in range(this_entry.num_directed_edges_in_group):
+                        directed_edge = this_entry.directed_edges_list[line_rows]
+                        if directed_edge[0].index == de_idx:
+                            continue
+                        if directed_edge[0].distance < line_graph_cutoff:
+                            line_graph_np[row, 0] = <cnp.int32_t> center
+                            line_graph_np[row, 1] = <cnp.int32_t> u_edge[0].index
+                            line_graph_np[row, 2] = <cnp.int32_t> de_idx
+                            line_graph_np[row, 3] = (
+                                <cnp.int32_t> directed_edge[0].undirected_edge_index
+                            )
+                            line_graph_np[row, 4] = (
+                                <cnp.int32_t> directed_edge[0].index
+                            )
+                            row += 1
+                free(node_neighbors)
+
+        return (
+            atom_graph_np,
+            directed2undirected_np,
+            undirected2directed_np,
+            line_graph_np,
+        )
+    finally:
+        _free_returned_graph(returned)
 
 def make_graph(
         const long[::1] center_index,
@@ -153,23 +302,7 @@ def make_graph(
             this_neighbors[this_neighbor_index] = replacement
 
 
-    # Free everything unneeded
-    for idx in range(returned[0].num_directed_edges):
-        free(returned[0].directed_edges_list[idx])
-
-    for idx in range(returned[0].num_undirected_edges):
-        free(returned[0].undirected_edges_list[idx].directed_edge_indices)
-        free(returned[0].undirected_edges_list[idx])
-
-
-    # Free node LongToDirectedEdgeList
-    free_LongToDirectedEdgeList_in_nodes(returned[0].nodes, returned[0].num_nodes)
-
-    free(returned[0].directed_edges_list)
-    free(returned[0].undirected_edges_list)
-    free(returned[0].nodes)
-
-    free(returned)
+    _free_returned_graph(returned)
     
     return py_nodes, py_directed_edges_list, py_undirected_edges_list, py_undirected_edges
 

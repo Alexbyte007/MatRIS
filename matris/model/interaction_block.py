@@ -15,6 +15,7 @@ from .functions import (
     Dimwise_softmax,
     directed2undirected_average_or_none,
     fused_line_attention_or_none,
+    alpha_project_line_attention_recompute_or_none,
     fused_line_attention_node_input_or_none,
     segment_softmax_weighted_sum_sorted_or_none,
     _use_line_attn_edge_bwd_fusion,
@@ -187,6 +188,10 @@ def _p101_use_cuda_gather_cat() -> bool:
 
 def _p101_use_node_input_attention() -> bool:
     return os.environ.get("MATRIS_P101_USE_NODE_INPUT_ATTENTION", "1") == "1"
+
+
+def _p202_use_line_attention_pipeline_recompute() -> bool:
+    return os.environ.get("MATRIS_P202_ATTN_LINE_PIPELINE_RECOMPUTE", "0") == "1"
 
 
 def _p105_use_attn_line_edge_alpha_cuda_bwd() -> bool:
@@ -1393,6 +1398,85 @@ def _p101_attention_node_input_forward(
     return fusion_node_feat, attn_cache
 
 
+def _p202_attention_node_input_recompute_forward_or_none(
+    edge_feat_0: Tensor,
+    values: Tensor,
+    node_feat: Tensor,
+    source_linear_cache: tuple[Tensor],
+    target_linear_cache: tuple[Tensor],
+    source_bias: Tensor | None,
+    target_bias: Tensor | None,
+    source_index: Tensor,
+    target_index: Tensor,
+    target_offsets: Tensor | None,
+) -> tuple[Tensor, dict[str, Any]] | None:
+    if not _p202_use_line_attention_pipeline_recompute():
+        return None
+    matris_op = _load_matris_op()
+    if (
+        matris_op is None
+        or not hasattr(matris_op, "fused_line_attention_forward_recompute")
+        or not hasattr(matris_op, "fused_line_attention_backward_recompute")
+    ):
+        return None
+    source_weight = source_linear_cache[0]
+    target_weight = target_linear_cache[0]
+    rows = int(node_feat.shape[0])
+    if not (
+        isinstance(target_offsets, Tensor)
+        and edge_feat_0.is_cuda
+        and values.is_cuda
+        and node_feat.is_cuda
+        and source_index.is_cuda
+        and target_index.is_cuda
+        and target_offsets.is_cuda
+        and source_weight.is_cuda
+        and target_weight.is_cuda
+        and edge_feat_0.dtype == torch.float32
+        and values.dtype == torch.float32
+        and node_feat.dtype == torch.float32
+        and source_weight.dtype == torch.float32
+        and target_weight.dtype == torch.float32
+        and source_index.dtype == torch.int64
+        and target_index.dtype == torch.int64
+        and target_offsets.dtype == torch.int64
+        and edge_feat_0.ndim == 2
+        and values.ndim == 2
+        and node_feat.ndim == 2
+        and edge_feat_0.shape == values.shape
+        and edge_feat_0.shape[-1] == 128
+        and node_feat.shape[-1] == 128
+        and source_weight.shape == (128, 128)
+        and target_weight.shape == (128, 128)
+        and target_offsets.ndim == 1
+        and target_offsets.numel() == rows + 1
+    ):
+        return None
+    source_logits = F.linear(edge_feat_0, source_weight, source_bias)
+    target_logits = F.linear(edge_feat_0, target_weight, target_bias)
+    source_out, target_out = matris_op.fused_line_attention_forward_recompute(
+        source_logits.contiguous(),
+        target_logits.contiguous(),
+        values.contiguous(),
+        source_index.contiguous(),
+        target_offsets.contiguous(),
+        rows,
+    )
+    fusion_node_feat = torch.cat([node_feat, target_out, source_out], dim=1)
+    return fusion_node_feat, {
+        "kind": "p202_recompute_node_input",
+        "edge_feat_0": edge_feat_0,
+        "values": values,
+        "fusion_node_feat": fusion_node_feat,
+        "source_weight": source_weight,
+        "target_weight": target_weight,
+        "source_index": source_index,
+        "target_index": target_index,
+        "target_offsets": target_offsets,
+        "node_rows": rows,
+    }
+
+
 def _p101_attention_node_input_backward(
     grad_fusion_node_feat: Tensor,
     cache: dict[str, Any],
@@ -1401,6 +1485,28 @@ def _p101_attention_node_input_backward(
     grad_node_direct = grad_fusion_node_feat[:, :dim].contiguous()
     grad_target_out = grad_fusion_node_feat[:, dim : 2 * dim].contiguous()
     grad_source_out = grad_fusion_node_feat[:, 2 * dim :].contiguous()
+    if cache["kind"] == "p202_recompute_node_input":
+        matris_op = _load_matris_op()
+        if matris_op is None or not hasattr(matris_op, "fused_line_attention_backward_recompute"):
+            raise RuntimeError("P202 requires matris_op.fused_line_attention_backward_recompute")
+        edge_feat_0 = cache["edge_feat_0"]
+        source_logits = F.linear(edge_feat_0, cache["source_weight"], None)
+        target_logits = F.linear(edge_feat_0, cache["target_weight"], None)
+        target_out = cache["fusion_node_feat"][:, dim : 2 * dim].contiguous()
+        source_out = cache["fusion_node_feat"][:, 2 * dim :].contiguous()
+        grad_source_logits, grad_target_logits, grad_values = matris_op.fused_line_attention_backward_recompute(
+            grad_source_out.contiguous(),
+            grad_target_out.contiguous(),
+            source_logits.contiguous(),
+            target_logits.contiguous(),
+            cache["values"].contiguous(),
+            source_out,
+            target_out,
+            cache["source_index"].contiguous(),
+            cache["target_offsets"].contiguous(),
+            int(cache["node_rows"]),
+        )
+        return grad_node_direct, grad_source_logits, grad_target_logits, grad_values
     if cache["kind"] == "cuda_node_input":
         target_out = cache["fusion_node_feat"][:, dim : 2 * dim].contiguous()
         source_out = cache["fusion_node_feat"][:, 2 * dim :].contiguous()
@@ -1428,6 +1534,8 @@ def _p106_attention_node_input_backward_edge_direct_or_none(
     cache: dict[str, Any],
     grad_edge_direct: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor] | None:
+    if cache["kind"] == "p202_recompute_node_input":
+        return None
     dim = grad_fusion_node_feat.shape[-1] // 3
     grad_node_direct = grad_fusion_node_feat[:, :dim].contiguous()
     grad_target_out = grad_fusion_node_feat[:, dim : 2 * dim].contiguous()
@@ -1463,6 +1571,8 @@ def _p107_attention_node_input_values_backward_or_none(
     cache: dict[str, Any],
     grad_edge_direct: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, dict[str, Any]] | None:
+    if cache["kind"] == "p202_recompute_node_input":
+        return None
     dim = grad_fusion_node_feat.shape[-1] // 3
     grad_node_direct = grad_fusion_node_feat[:, :dim].contiguous()
     grad_target_out = grad_fusion_node_feat[:, dim : 2 * dim].contiguous()
@@ -2017,17 +2127,36 @@ def _p101_attention_layer_forward(
     target_index = graph["target_index"]
     edge_x, gather_cache = _p101_line_gather_cat_forward(node_feat, edge_feat, source_index, target_index)
     edge_values, edge_cache = _p53b_apply_update(layer.edge_nonlinear_update, edge_x)
-    source_logits, source_linear_cache = _p53b_linear_forward(edge_feat, layer.source_weight_linear)
-    target_logits, target_linear_cache = _p53b_linear_forward(edge_feat, layer.target_weight_linear)
-    node_x, attn_cache = _p101_attention_node_input_forward(
-        source_logits,
-        target_logits,
+    source_weight, _source_bias = _p53b_weight_bias(layer.source_weight_linear)
+    target_weight, _target_bias = _p53b_weight_bias(layer.target_weight_linear)
+    source_linear_cache = (source_weight,)
+    target_linear_cache = (target_weight,)
+    p202_node_input = _p202_attention_node_input_recompute_forward_or_none(
+        edge_feat,
         edge_values,
         node_feat,
+        source_linear_cache,
+        target_linear_cache,
+        _source_bias,
+        _target_bias,
         source_index,
         target_index,
         graph.get("target_segment_offsets"),
     )
+    if p202_node_input is None:
+        source_logits = F.linear(edge_feat, source_weight, _source_bias)
+        target_logits = F.linear(edge_feat, target_weight, _target_bias)
+        node_x, attn_cache = _p101_attention_node_input_forward(
+            source_logits,
+            target_logits,
+            edge_values,
+            node_feat,
+            source_index,
+            target_index,
+            graph.get("target_segment_offsets"),
+        )
+    else:
+        node_x, attn_cache = p202_node_input
     node_update, node_cache = _p53b_apply_update(layer.node_nonlinear_update, node_x)
     node_out = node_update + layer.node_res_weight.float() * node_feat
     edge_out = edge_values + layer.edge_res_weight.float() * edge_feat
@@ -3094,6 +3223,25 @@ class Graph_Attention_Layer(nn.Module):
                 lambda: self.edge_nonlinear_update(attn_edge_feat),
             )
 
+        alpha_attention_recompute = None
+        if directed2undirected is None and profile_prefix.endswith(".attn_line"):
+            alpha_attention_recompute = timed_detail(
+                "alpha_attention_recompute",
+                (edge_feat_0, attn_edge_feat, source_node_index, target_node_index),
+                lambda: alpha_project_line_attention_recompute_or_none(
+                    edge_feat_0,
+                    attn_edge_feat,
+                    self.source_weight_linear,
+                    self.target_weight_linear,
+                    source_node_index,
+                    graph.get("target_segment_offsets"),
+                    len(node_feat),
+                    enable_hint=True,
+                    source_offsets=graph.get("source_segment_offsets"),
+                    source_order=graph.get("source_sort_order"),
+                ),
+            )
+
         # ======= update atom feature ======= 
         def alpha_projection():
             if (
@@ -3129,14 +3277,21 @@ class Graph_Attention_Layer(nn.Module):
                 self.target_weight_linear(edge_feat_0),
             )
 
-        source_alpha_0, target_alpha_0 = timed_detail(
-            "alpha_projection",
-            (edge_feat_0,),
-            alpha_projection,
-        )
+        if alpha_attention_recompute is None:
+            source_alpha_0, target_alpha_0 = timed_detail(
+                "alpha_projection",
+                (edge_feat_0,),
+                alpha_projection,
+            )
+        else:
+            source_alpha_0, target_alpha_0 = None, None
 
         fusion_node_feat = None
-        if directed2undirected is None and profile_prefix.endswith(".attn_line"):
+        if (
+            alpha_attention_recompute is None
+            and directed2undirected is None
+            and profile_prefix.endswith(".attn_line")
+        ):
             fusion_node_feat = timed_detail(
                 "attention_reduce_node_input",
                 (source_alpha_0, target_alpha_0, attn_edge_feat, node_feat),
@@ -3295,11 +3450,14 @@ class Graph_Attention_Layer(nn.Module):
                 attn_target_feat = target_attention_sum
             return attn_source_feat, attn_target_feat
 
-        attn_source_feat, attn_target_feat = timed_detail(
-            "attention_reduce",
-            (source_alpha_0, target_alpha_0, attn_edge_feat),
-            attention_reduce,
-        )
+        if alpha_attention_recompute is None:
+            attn_source_feat, attn_target_feat = timed_detail(
+                "attention_reduce",
+                (source_alpha_0, target_alpha_0, attn_edge_feat),
+                attention_reduce,
+            )
+        else:
+            attn_source_feat, attn_target_feat = alpha_attention_recompute
         
         if directed2undirected is not None:
             directed_average = directed2undirected_average_or_none(

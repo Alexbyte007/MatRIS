@@ -210,6 +210,24 @@ __global__ void fused_line_attention_source_exp_sum_kernel(
   atomicAdd(source_sum + s * kDim + dim, se);
 }
 
+__global__ void fused_line_attention_source_exp_sum_no_alpha_kernel(
+    const float* __restrict__ source_logits,
+    const int64_t* __restrict__ source_index,
+    const float* __restrict__ source_max,
+    float* __restrict__ source_sum,
+    int64_t rows) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = rows * kDim;
+  if (idx >= total) {
+    return;
+  }
+  int64_t row = idx / kDim;
+  int dim = idx - row * kDim;
+  int64_t s = source_index[row];
+  float se = expf(source_logits[idx] - source_max[s * kDim + dim]);
+  atomicAdd(source_sum + s * kDim + dim, se);
+}
+
 __global__ void fused_line_attention_source_norm_out_kernel(
     const float* __restrict__ values,
     const int64_t* __restrict__ source_index,
@@ -227,6 +245,27 @@ __global__ void fused_line_attention_source_norm_out_kernel(
   int64_t s = source_index[row];
   float sa = source_alpha[idx] / source_sum[s * kDim + dim];
   source_alpha[idx] = sa;
+  atomicAdd(source_out + s * kDim + dim, sa * values[idx]);
+}
+
+__global__ void fused_line_attention_source_norm_out_no_alpha_kernel(
+    const float* __restrict__ source_logits,
+    const float* __restrict__ values,
+    const int64_t* __restrict__ source_index,
+    const float* __restrict__ source_max,
+    const float* __restrict__ source_sum,
+    float* __restrict__ source_out,
+    int64_t rows) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = rows * kDim;
+  if (idx >= total) {
+    return;
+  }
+  int64_t row = idx / kDim;
+  int dim = idx - row * kDim;
+  int64_t s = source_index[row];
+  float denom = source_sum[s * kDim + dim];
+  float sa = denom > 0.0f ? expf(source_logits[idx] - source_max[s * kDim + dim]) / denom : 0.0f;
   atomicAdd(source_out + s * kDim + dim, sa * values[idx]);
 }
 
@@ -267,6 +306,67 @@ __global__ void fused_line_attention_target_offsets_forward_kernel(
     out_v += alpha * values[idx];
   }
   target_out[segment * kDim + dim] = out_v;
+}
+
+__global__ void fused_line_attention_target_offsets_forward_no_alpha_kernel(
+    const float* __restrict__ target_logits,
+    const float* __restrict__ values,
+    const int64_t* __restrict__ target_offsets,
+    float* __restrict__ target_out,
+    int64_t num_segments) {
+  int64_t segment = blockIdx.x;
+  int dim = threadIdx.x;
+  if (segment >= num_segments || dim >= kDim) {
+    return;
+  }
+  int64_t start = target_offsets[segment];
+  int64_t end = target_offsets[segment + 1];
+  float max_v = -FLT_MAX;
+  for (int64_t row = start; row < end; ++row) {
+    max_v = fmaxf(max_v, target_logits[row * kDim + dim]);
+  }
+
+  float sum_v = 0.0f;
+  float out_v = 0.0f;
+  for (int64_t row = start; row < end; ++row) {
+    int64_t idx = row * kDim + dim;
+    float e = expf(target_logits[idx] - max_v);
+    sum_v += e;
+    out_v += e * values[idx];
+  }
+  target_out[segment * kDim + dim] = sum_v > 0.0f ? out_v / sum_v : 0.0f;
+}
+
+__global__ void fused_line_attention_source_offsets_forward_no_alpha_kernel(
+    const float* __restrict__ source_logits,
+    const float* __restrict__ values,
+    const int64_t* __restrict__ source_offsets,
+    const int64_t* __restrict__ source_order,
+    float* __restrict__ source_out,
+    int64_t num_segments) {
+  int64_t segment = blockIdx.x;
+  int dim = threadIdx.x;
+  if (segment >= num_segments || dim >= kDim) {
+    return;
+  }
+  int64_t start = source_offsets[segment];
+  int64_t end = source_offsets[segment + 1];
+  float max_v = -FLT_MAX;
+  for (int64_t pos = start; pos < end; ++pos) {
+    int64_t row = source_order[pos];
+    max_v = fmaxf(max_v, source_logits[row * kDim + dim]);
+  }
+
+  float sum_v = 0.0f;
+  float out_v = 0.0f;
+  for (int64_t pos = start; pos < end; ++pos) {
+    int64_t row = source_order[pos];
+    int64_t idx = row * kDim + dim;
+    float e = expf(source_logits[idx] - max_v);
+    sum_v += e;
+    out_v += e * values[idx];
+  }
+  source_out[segment * kDim + dim] = sum_v > 0.0f ? out_v / sum_v : 0.0f;
 }
 
 __global__ void fused_line_attention_node_input_init_kernel(
@@ -382,6 +482,110 @@ __global__ void fused_line_attention_backward_kernel(
   grad_source_logits[idx] = sa * gs * (v - os);
   grad_target_logits[idx] = ta * gt * (v - ot);
   grad_values[idx] = sa * gs + ta * gt;
+}
+
+__global__ void fused_line_attention_source_backward_recompute_kernel(
+    const float* __restrict__ grad_source_out,
+    const float* __restrict__ source_logits,
+    const float* __restrict__ values,
+    const float* __restrict__ source_out,
+    const float* __restrict__ source_max,
+    const float* __restrict__ source_sum,
+    const int64_t* __restrict__ source_index,
+    float* __restrict__ grad_source_logits,
+    float* __restrict__ grad_values,
+    int64_t rows) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int64_t total = rows * kDim;
+  if (idx >= total) {
+    return;
+  }
+  int64_t row = idx / kDim;
+  int dim = idx - row * kDim;
+  int64_t s = source_index[row];
+  float denom = source_sum[s * kDim + dim];
+  float sa = denom > 0.0f ? expf(source_logits[idx] - source_max[s * kDim + dim]) / denom : 0.0f;
+  float gs = grad_source_out[s * kDim + dim];
+  float v = values[idx];
+  float os = source_out[s * kDim + dim];
+  grad_source_logits[idx] = sa * gs * (v - os);
+  grad_values[idx] = sa * gs;
+}
+
+__global__ void fused_line_attention_target_backward_recompute_add_kernel(
+    const float* __restrict__ grad_target_out,
+    const float* __restrict__ target_logits,
+    const float* __restrict__ values,
+    const float* __restrict__ target_out,
+    const int64_t* __restrict__ target_offsets,
+    float* __restrict__ grad_target_logits,
+    float* __restrict__ grad_values,
+    int64_t num_segments) {
+  int64_t segment = blockIdx.x;
+  int dim = threadIdx.x;
+  if (segment >= num_segments || dim >= kDim) {
+    return;
+  }
+  int64_t start = target_offsets[segment];
+  int64_t end = target_offsets[segment + 1];
+  float max_v = -FLT_MAX;
+  for (int64_t row = start; row < end; ++row) {
+    max_v = fmaxf(max_v, target_logits[row * kDim + dim]);
+  }
+
+  float sum_v = 0.0f;
+  for (int64_t row = start; row < end; ++row) {
+    sum_v += expf(target_logits[row * kDim + dim] - max_v);
+  }
+  float inv_sum = sum_v > 0.0f ? 1.0f / sum_v : 0.0f;
+  float gt = grad_target_out[segment * kDim + dim];
+  float ot = target_out[segment * kDim + dim];
+  for (int64_t row = start; row < end; ++row) {
+    int64_t idx = row * kDim + dim;
+    float ta = expf(target_logits[idx] - max_v) * inv_sum;
+    grad_target_logits[idx] = ta * gt * (values[idx] - ot);
+    grad_values[idx] += ta * gt;
+  }
+}
+
+__global__ void fused_line_attention_source_offsets_backward_recompute_kernel(
+    const float* __restrict__ grad_source_out,
+    const float* __restrict__ source_logits,
+    const float* __restrict__ values,
+    const float* __restrict__ source_out,
+    const int64_t* __restrict__ source_offsets,
+    const int64_t* __restrict__ source_order,
+    float* __restrict__ grad_source_logits,
+    float* __restrict__ grad_values,
+    int64_t num_segments) {
+  int64_t segment = blockIdx.x;
+  int dim = threadIdx.x;
+  if (segment >= num_segments || dim >= kDim) {
+    return;
+  }
+  int64_t start = source_offsets[segment];
+  int64_t end = source_offsets[segment + 1];
+  float max_v = -FLT_MAX;
+  for (int64_t pos = start; pos < end; ++pos) {
+    int64_t row = source_order[pos];
+    max_v = fmaxf(max_v, source_logits[row * kDim + dim]);
+  }
+
+  float sum_v = 0.0f;
+  for (int64_t pos = start; pos < end; ++pos) {
+    int64_t row = source_order[pos];
+    sum_v += expf(source_logits[row * kDim + dim] - max_v);
+  }
+  float inv_sum = sum_v > 0.0f ? 1.0f / sum_v : 0.0f;
+  float gs = grad_source_out[segment * kDim + dim];
+  float os = source_out[segment * kDim + dim];
+  for (int64_t pos = start; pos < end; ++pos) {
+    int64_t row = source_order[pos];
+    int64_t idx = row * kDim + dim;
+    float sa = expf(source_logits[idx] - max_v) * inv_sum;
+    grad_source_logits[idx] = sa * gs * (values[idx] - os);
+    grad_values[idx] = sa * gs;
+  }
 }
 
 __global__ void fused_line_attention_backward_with_edge_direct_kernel(
@@ -856,6 +1060,137 @@ std::vector<torch::Tensor> fused_line_attention_forward_target_offsets(const tor
   return {source_out, target_out, source_alpha, target_alpha};
 }
 
+std::vector<torch::Tensor> fused_line_attention_forward_recompute(
+    const torch::Tensor &source_logits,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_offsets,
+    int64_t num_segments) {
+  TORCH_CHECK(source_logits.is_cuda() && target_logits.is_cuda() && values.is_cuda() &&
+                  source_index.is_cuda() && target_offsets.is_cuda(),
+              "fused_line_attention_forward_recompute: tensors must be CUDA");
+  TORCH_CHECK(source_logits.scalar_type() == torch::kFloat32 &&
+                  target_logits.scalar_type() == torch::kFloat32 &&
+                  values.scalar_type() == torch::kFloat32,
+              "fused_line_attention_forward_recompute: float tensors must be float32");
+  TORCH_CHECK(source_index.scalar_type() == torch::kInt64 && target_offsets.scalar_type() == torch::kInt64,
+              "fused_line_attention_forward_recompute: indices must be int64");
+  TORCH_CHECK(source_logits.dim() == 2 && source_logits.size(1) == kDim,
+              "fused_line_attention_forward_recompute: logits must be [E, 128]");
+  TORCH_CHECK(source_logits.sizes() == target_logits.sizes() && source_logits.sizes() == values.sizes(),
+              "fused_line_attention_forward_recompute: tensor shape mismatch");
+  TORCH_CHECK(source_index.dim() == 1 && source_index.size(0) == source_logits.size(0),
+              "fused_line_attention_forward_recompute: source_index shape mismatch");
+  TORCH_CHECK(target_offsets.dim() == 1 && target_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_forward_recompute: target_offsets shape mismatch");
+
+  auto source_logits_c = source_logits.contiguous();
+  auto target_logits_c = target_logits.contiguous();
+  auto values_c = values.contiguous();
+  auto source_index_c = source_index.contiguous();
+  auto target_offsets_c = target_offsets.contiguous();
+  auto opts = source_logits.options();
+  auto source_max = torch::empty({num_segments, kDim}, opts);
+  auto source_sum = torch::empty({num_segments, kDim}, opts);
+  auto source_out = torch::empty({num_segments, kDim}, opts);
+  auto target_out = torch::empty({num_segments, kDim}, opts);
+
+  int64_t rows = source_logits_c.size(0);
+  int64_t init_total = num_segments * kDim;
+  int init_blocks = static_cast<int>((init_total + kThreads - 1) / kThreads);
+  int row_blocks = static_cast<int>((rows * kDim + kThreads - 1) / kThreads);
+  fused_line_attention_source_init_kernel<<<init_blocks, kThreads>>>(
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      source_out.data_ptr<float>(),
+      init_total);
+  fused_line_attention_single_max_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      rows);
+  fused_line_attention_source_exp_sum_no_alpha_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      rows);
+  fused_line_attention_source_norm_out_no_alpha_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      source_out.data_ptr<float>(),
+      rows);
+  fused_line_attention_target_offsets_forward_no_alpha_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      target_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      target_offsets_c.data_ptr<int64_t>(),
+      target_out.data_ptr<float>(),
+      num_segments);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {source_out, target_out};
+}
+
+std::vector<torch::Tensor> fused_line_attention_forward_recompute_source_offsets(
+    const torch::Tensor &source_logits,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_offsets,
+    const torch::Tensor &source_order,
+    const torch::Tensor &target_offsets,
+    int64_t num_segments) {
+  TORCH_CHECK(source_logits.is_cuda() && target_logits.is_cuda() && values.is_cuda() &&
+                  source_offsets.is_cuda() && source_order.is_cuda() && target_offsets.is_cuda(),
+              "fused_line_attention_forward_recompute_source_offsets: tensors must be CUDA");
+  TORCH_CHECK(source_logits.scalar_type() == torch::kFloat32 &&
+                  target_logits.scalar_type() == torch::kFloat32 &&
+                  values.scalar_type() == torch::kFloat32,
+              "fused_line_attention_forward_recompute_source_offsets: float tensors must be float32");
+  TORCH_CHECK(source_offsets.scalar_type() == torch::kInt64 &&
+                  source_order.scalar_type() == torch::kInt64 &&
+                  target_offsets.scalar_type() == torch::kInt64,
+              "fused_line_attention_forward_recompute_source_offsets: indices must be int64");
+  TORCH_CHECK(source_logits.dim() == 2 && source_logits.size(1) == kDim,
+              "fused_line_attention_forward_recompute_source_offsets: logits must be [E, 128]");
+  TORCH_CHECK(source_logits.sizes() == target_logits.sizes() && source_logits.sizes() == values.sizes(),
+              "fused_line_attention_forward_recompute_source_offsets: tensor shape mismatch");
+  TORCH_CHECK(source_offsets.dim() == 1 && source_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_forward_recompute_source_offsets: source_offsets shape mismatch");
+  TORCH_CHECK(target_offsets.dim() == 1 && target_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_forward_recompute_source_offsets: target_offsets shape mismatch");
+  TORCH_CHECK(source_order.dim() == 1 && source_order.size(0) == source_logits.size(0),
+              "fused_line_attention_forward_recompute_source_offsets: source_order shape mismatch");
+
+  auto source_logits_c = source_logits.contiguous();
+  auto target_logits_c = target_logits.contiguous();
+  auto values_c = values.contiguous();
+  auto source_offsets_c = source_offsets.contiguous();
+  auto source_order_c = source_order.contiguous();
+  auto target_offsets_c = target_offsets.contiguous();
+  auto opts = source_logits.options();
+  auto source_out = torch::empty({num_segments, kDim}, opts);
+  auto target_out = torch::empty({num_segments, kDim}, opts);
+
+  fused_line_attention_source_offsets_forward_no_alpha_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      source_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      source_offsets_c.data_ptr<int64_t>(),
+      source_order_c.data_ptr<int64_t>(),
+      source_out.data_ptr<float>(),
+      num_segments);
+  fused_line_attention_target_offsets_forward_no_alpha_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      target_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      target_offsets_c.data_ptr<int64_t>(),
+      target_out.data_ptr<float>(),
+      num_segments);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {source_out, target_out};
+}
+
 std::vector<torch::Tensor> fused_line_attention_node_input_forward_target_offsets(
     const torch::Tensor &source_logits,
     const torch::Tensor &target_logits,
@@ -990,6 +1325,297 @@ std::vector<torch::Tensor> fused_line_attention_backward(const torch::Tensor &gr
       rows);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {grad_source_logits, grad_target_logits, grad_values};
+}
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &source_logits,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &target_out,
+    const torch::Tensor &source_index,
+    const torch::Tensor &target_offsets,
+    int64_t num_segments) {
+  TORCH_CHECK(grad_source_out.is_cuda() && grad_target_out.is_cuda() && source_logits.is_cuda() &&
+                  target_logits.is_cuda() && values.is_cuda() && source_out.is_cuda() &&
+                  target_out.is_cuda() && source_index.is_cuda() && target_offsets.is_cuda(),
+              "fused_line_attention_backward_recompute: tensors must be CUDA");
+  TORCH_CHECK(source_logits.scalar_type() == torch::kFloat32 &&
+                  target_logits.scalar_type() == torch::kFloat32 &&
+                  values.scalar_type() == torch::kFloat32 &&
+                  grad_source_out.scalar_type() == torch::kFloat32 &&
+                  grad_target_out.scalar_type() == torch::kFloat32,
+              "fused_line_attention_backward_recompute: float tensors must be float32");
+  TORCH_CHECK(source_index.scalar_type() == torch::kInt64 && target_offsets.scalar_type() == torch::kInt64,
+              "fused_line_attention_backward_recompute: indices must be int64");
+  TORCH_CHECK(source_logits.dim() == 2 && source_logits.size(1) == kDim,
+              "fused_line_attention_backward_recompute: logits must be [E, 128]");
+  TORCH_CHECK(source_logits.sizes() == target_logits.sizes() && source_logits.sizes() == values.sizes(),
+              "fused_line_attention_backward_recompute: tensor shape mismatch");
+  TORCH_CHECK(grad_source_out.sizes() == source_out.sizes() && grad_target_out.sizes() == target_out.sizes(),
+              "fused_line_attention_backward_recompute: grad/out shape mismatch");
+  TORCH_CHECK(source_index.dim() == 1 && source_index.size(0) == source_logits.size(0),
+              "fused_line_attention_backward_recompute: source_index shape mismatch");
+  TORCH_CHECK(target_offsets.dim() == 1 && target_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_backward_recompute: target_offsets shape mismatch");
+
+  auto grad_source_out_c = grad_source_out.contiguous();
+  auto grad_target_out_c = grad_target_out.contiguous();
+  auto source_logits_c = source_logits.contiguous();
+  auto target_logits_c = target_logits.contiguous();
+  auto values_c = values.contiguous();
+  auto source_out_c = source_out.contiguous();
+  auto target_out_c = target_out.contiguous();
+  auto source_index_c = source_index.contiguous();
+  auto target_offsets_c = target_offsets.contiguous();
+  auto opts = source_logits.options();
+  auto source_max = torch::empty({num_segments, kDim}, opts);
+  auto source_sum = torch::empty({num_segments, kDim}, opts);
+  auto source_out_scratch = torch::empty({num_segments, kDim}, opts);
+  auto grad_source_logits = torch::empty_like(source_logits_c);
+  auto grad_target_logits = torch::empty_like(target_logits_c);
+  auto grad_values = torch::empty_like(values_c);
+
+  int64_t rows = source_logits_c.size(0);
+  int64_t init_total = num_segments * kDim;
+  int init_blocks = static_cast<int>((init_total + kThreads - 1) / kThreads);
+  int row_blocks = static_cast<int>((rows * kDim + kThreads - 1) / kThreads);
+  fused_line_attention_source_init_kernel<<<init_blocks, kThreads>>>(
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      source_out_scratch.data_ptr<float>(),
+      init_total);
+  fused_line_attention_single_max_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      rows);
+  fused_line_attention_source_exp_sum_no_alpha_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      rows);
+  fused_line_attention_source_backward_recompute_kernel<<<row_blocks, kThreads>>>(
+      grad_source_out_c.data_ptr<float>(),
+      source_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      source_out_c.data_ptr<float>(),
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      grad_source_logits.data_ptr<float>(),
+      grad_values.data_ptr<float>(),
+      rows);
+  fused_line_attention_target_backward_recompute_add_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      grad_target_out_c.data_ptr<float>(),
+      target_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      target_out_c.data_ptr<float>(),
+      target_offsets_c.data_ptr<int64_t>(),
+      grad_target_logits.data_ptr<float>(),
+      grad_values.data_ptr<float>(),
+      num_segments);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_source_logits, grad_target_logits, grad_values};
+}
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute_source_offsets(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &source_logits,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &target_out,
+    const torch::Tensor &source_offsets,
+    const torch::Tensor &source_order,
+    const torch::Tensor &target_offsets,
+    int64_t num_segments) {
+  TORCH_CHECK(grad_source_out.is_cuda() && grad_target_out.is_cuda() && source_logits.is_cuda() &&
+                  target_logits.is_cuda() && values.is_cuda() && source_out.is_cuda() &&
+                  target_out.is_cuda() && source_offsets.is_cuda() && source_order.is_cuda() &&
+                  target_offsets.is_cuda(),
+              "fused_line_attention_backward_recompute_source_offsets: tensors must be CUDA");
+  TORCH_CHECK(source_logits.scalar_type() == torch::kFloat32 &&
+                  target_logits.scalar_type() == torch::kFloat32 &&
+                  values.scalar_type() == torch::kFloat32 &&
+                  grad_source_out.scalar_type() == torch::kFloat32 &&
+                  grad_target_out.scalar_type() == torch::kFloat32,
+              "fused_line_attention_backward_recompute_source_offsets: float tensors must be float32");
+  TORCH_CHECK(source_offsets.scalar_type() == torch::kInt64 &&
+                  source_order.scalar_type() == torch::kInt64 &&
+                  target_offsets.scalar_type() == torch::kInt64,
+              "fused_line_attention_backward_recompute_source_offsets: indices must be int64");
+  TORCH_CHECK(source_logits.dim() == 2 && source_logits.size(1) == kDim,
+              "fused_line_attention_backward_recompute_source_offsets: logits must be [E, 128]");
+  TORCH_CHECK(source_logits.sizes() == target_logits.sizes() && source_logits.sizes() == values.sizes(),
+              "fused_line_attention_backward_recompute_source_offsets: tensor shape mismatch");
+  TORCH_CHECK(grad_source_out.sizes() == source_out.sizes() && grad_target_out.sizes() == target_out.sizes(),
+              "fused_line_attention_backward_recompute_source_offsets: grad/out shape mismatch");
+  TORCH_CHECK(source_offsets.dim() == 1 && source_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_backward_recompute_source_offsets: source_offsets shape mismatch");
+  TORCH_CHECK(target_offsets.dim() == 1 && target_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_backward_recompute_source_offsets: target_offsets shape mismatch");
+  TORCH_CHECK(source_order.dim() == 1 && source_order.size(0) == source_logits.size(0),
+              "fused_line_attention_backward_recompute_source_offsets: source_order shape mismatch");
+
+  auto grad_source_out_c = grad_source_out.contiguous();
+  auto grad_target_out_c = grad_target_out.contiguous();
+  auto source_logits_c = source_logits.contiguous();
+  auto target_logits_c = target_logits.contiguous();
+  auto values_c = values.contiguous();
+  auto source_out_c = source_out.contiguous();
+  auto target_out_c = target_out.contiguous();
+  auto source_offsets_c = source_offsets.contiguous();
+  auto source_order_c = source_order.contiguous();
+  auto target_offsets_c = target_offsets.contiguous();
+  auto grad_source_logits = torch::empty_like(source_logits_c);
+  auto grad_target_logits = torch::empty_like(target_logits_c);
+  auto grad_values = torch::empty_like(values_c);
+
+  fused_line_attention_source_offsets_backward_recompute_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      grad_source_out_c.data_ptr<float>(),
+      source_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      source_out_c.data_ptr<float>(),
+      source_offsets_c.data_ptr<int64_t>(),
+      source_order_c.data_ptr<int64_t>(),
+      grad_source_logits.data_ptr<float>(),
+      grad_values.data_ptr<float>(),
+      num_segments);
+  fused_line_attention_target_backward_recompute_add_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      grad_target_out_c.data_ptr<float>(),
+      target_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      target_out_c.data_ptr<float>(),
+      target_offsets_c.data_ptr<int64_t>(),
+      grad_target_logits.data_ptr<float>(),
+      grad_values.data_ptr<float>(),
+      num_segments);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_source_logits, grad_target_logits, grad_values};
+}
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute_source(
+    const torch::Tensor &grad_source_out,
+    const torch::Tensor &source_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &source_out,
+    const torch::Tensor &source_index,
+    int64_t num_segments) {
+  TORCH_CHECK(grad_source_out.is_cuda() && source_logits.is_cuda() && values.is_cuda() &&
+                  source_out.is_cuda() && source_index.is_cuda(),
+              "fused_line_attention_backward_recompute_source: tensors must be CUDA");
+  TORCH_CHECK(source_logits.scalar_type() == torch::kFloat32 &&
+                  values.scalar_type() == torch::kFloat32 &&
+                  grad_source_out.scalar_type() == torch::kFloat32,
+              "fused_line_attention_backward_recompute_source: float tensors must be float32");
+  TORCH_CHECK(source_index.scalar_type() == torch::kInt64,
+              "fused_line_attention_backward_recompute_source: source_index must be int64");
+  TORCH_CHECK(source_logits.dim() == 2 && source_logits.size(1) == kDim,
+              "fused_line_attention_backward_recompute_source: logits must be [E, 128]");
+  TORCH_CHECK(source_logits.sizes() == values.sizes(),
+              "fused_line_attention_backward_recompute_source: tensor shape mismatch");
+  TORCH_CHECK(grad_source_out.sizes() == source_out.sizes(),
+              "fused_line_attention_backward_recompute_source: grad/out shape mismatch");
+  TORCH_CHECK(source_index.dim() == 1 && source_index.size(0) == source_logits.size(0),
+              "fused_line_attention_backward_recompute_source: source_index shape mismatch");
+
+  auto grad_source_out_c = grad_source_out.contiguous();
+  auto source_logits_c = source_logits.contiguous();
+  auto values_c = values.contiguous();
+  auto source_out_c = source_out.contiguous();
+  auto source_index_c = source_index.contiguous();
+  auto opts = source_logits.options();
+  auto source_max = torch::empty({num_segments, kDim}, opts);
+  auto source_sum = torch::empty({num_segments, kDim}, opts);
+  auto source_out_scratch = torch::empty({num_segments, kDim}, opts);
+  auto grad_source_logits = torch::empty_like(source_logits_c);
+  auto grad_values = torch::empty_like(values_c);
+
+  int64_t rows = source_logits_c.size(0);
+  int64_t init_total = num_segments * kDim;
+  int init_blocks = static_cast<int>((init_total + kThreads - 1) / kThreads);
+  int row_blocks = static_cast<int>((rows * kDim + kThreads - 1) / kThreads);
+  fused_line_attention_source_init_kernel<<<init_blocks, kThreads>>>(
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      source_out_scratch.data_ptr<float>(),
+      init_total);
+  fused_line_attention_single_max_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      rows);
+  fused_line_attention_source_exp_sum_no_alpha_kernel<<<row_blocks, kThreads>>>(
+      source_logits_c.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      rows);
+  fused_line_attention_source_backward_recompute_kernel<<<row_blocks, kThreads>>>(
+      grad_source_out_c.data_ptr<float>(),
+      source_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      source_out_c.data_ptr<float>(),
+      source_max.data_ptr<float>(),
+      source_sum.data_ptr<float>(),
+      source_index_c.data_ptr<int64_t>(),
+      grad_source_logits.data_ptr<float>(),
+      grad_values.data_ptr<float>(),
+      rows);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_source_logits, grad_values};
+}
+
+std::vector<torch::Tensor> fused_line_attention_backward_recompute_target_add(
+    const torch::Tensor &grad_target_out,
+    const torch::Tensor &target_logits,
+    const torch::Tensor &values,
+    const torch::Tensor &target_out,
+    const torch::Tensor &target_offsets,
+    const torch::Tensor &grad_values,
+    int64_t num_segments) {
+  TORCH_CHECK(grad_target_out.is_cuda() && target_logits.is_cuda() && values.is_cuda() &&
+                  target_out.is_cuda() && target_offsets.is_cuda() && grad_values.is_cuda(),
+              "fused_line_attention_backward_recompute_target_add: tensors must be CUDA");
+  TORCH_CHECK(target_logits.scalar_type() == torch::kFloat32 &&
+                  values.scalar_type() == torch::kFloat32 &&
+                  grad_target_out.scalar_type() == torch::kFloat32 &&
+                  grad_values.scalar_type() == torch::kFloat32,
+              "fused_line_attention_backward_recompute_target_add: float tensors must be float32");
+  TORCH_CHECK(target_offsets.scalar_type() == torch::kInt64,
+              "fused_line_attention_backward_recompute_target_add: target_offsets must be int64");
+  TORCH_CHECK(target_logits.dim() == 2 && target_logits.size(1) == kDim,
+              "fused_line_attention_backward_recompute_target_add: logits must be [E, 128]");
+  TORCH_CHECK(target_logits.sizes() == values.sizes() && target_logits.sizes() == grad_values.sizes(),
+              "fused_line_attention_backward_recompute_target_add: tensor shape mismatch");
+  TORCH_CHECK(grad_target_out.sizes() == target_out.sizes(),
+              "fused_line_attention_backward_recompute_target_add: grad/out shape mismatch");
+  TORCH_CHECK(target_offsets.dim() == 1 && target_offsets.size(0) == num_segments + 1,
+              "fused_line_attention_backward_recompute_target_add: target_offsets shape mismatch");
+
+  auto grad_target_out_c = grad_target_out.contiguous();
+  auto target_logits_c = target_logits.contiguous();
+  auto values_c = values.contiguous();
+  auto target_out_c = target_out.contiguous();
+  auto target_offsets_c = target_offsets.contiguous();
+  auto grad_values_c = grad_values.contiguous();
+  auto grad_target_logits = torch::empty_like(target_logits_c);
+  fused_line_attention_target_backward_recompute_add_kernel<<<static_cast<int>(num_segments), kDim>>>(
+      grad_target_out_c.data_ptr<float>(),
+      target_logits_c.data_ptr<float>(),
+      values_c.data_ptr<float>(),
+      target_out_c.data_ptr<float>(),
+      target_offsets_c.data_ptr<int64_t>(),
+      grad_target_logits.data_ptr<float>(),
+      grad_values_c.data_ptr<float>(),
+      num_segments);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {grad_target_logits, grad_values_c};
 }
 
 std::vector<torch::Tensor> fused_line_attention_backward_with_edge_direct(
